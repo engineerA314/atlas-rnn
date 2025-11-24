@@ -25,11 +25,13 @@ try:
 except ImportError:
     pass
 
-def create_mac_block_mask(seq_len, window_size, persist_mem_len, sliding = False):
+def create_mac_block_mask(seq_len, window_size, persist_mem_len, sliding = False, context_len = 0):
 
     def create_mac_mask(_, __, q_idx, kv_idx):
         is_persist_mem = kv_idx < persist_mem_len
-        kv_without_mem = kv_idx - persist_mem_len
+        is_context = (kv_idx >= persist_mem_len) & (kv_idx < (persist_mem_len + context_len))
+
+        kv_without_mem = kv_idx - persist_mem_len - context_len
         causal_mask = q_idx >= kv_without_mem
 
         if not sliding:
@@ -39,9 +41,9 @@ def create_mac_block_mask(seq_len, window_size, persist_mem_len, sliding = False
             sliding_mask = (q_idx - kv_without_mem) <= window_size
             causal_mask = causal_mask & sliding_mask
 
-        return is_persist_mem | (~is_persist_mem & causal_mask)
+        return is_persist_mem | is_context | (~is_persist_mem & ~is_context & causal_mask)
 
-    block_mask = create_block_mask(create_mac_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len + persist_mem_len, _compile = True)
+    block_mask = create_block_mask(create_mac_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len + persist_mem_len + context_len, _compile = True)
     return block_mask
 
 # einstein notation related
@@ -237,6 +239,7 @@ class SegmentedAttention(Module):
         cache,
         value_residual = None,
         output_gating = None,
+        context = None,
     ):
         batch = token.shape[0]
 
@@ -266,6 +269,16 @@ class SegmentedAttention(Module):
         # relative positions
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # context kv (prepend to kv for attention only; not cached)
+
+        if exists(context):
+            ctx = self.norm(context)
+            q_ctx, k_ctx, v_ctx = self.to_qkv(ctx).chunk(3, dim = -1)
+            q_ctx, k_ctx, v_ctx = map(self.split_heads, (q_ctx, k_ctx, v_ctx))
+            _, k_ctx = self.rotary_emb.rotate_queries_with_cached_keys(q_ctx, k_ctx)
+            k = cat((k_ctx, k), dim = -2)
+            v = cat((v_ctx, v), dim = -2)
 
         # fold
 
@@ -299,7 +312,8 @@ class SegmentedAttention(Module):
         value_residual = None,
         flex_attn_fn: Callable | None = None,
         output_gating = None,
-        cache = None
+        cache = None,
+        context = None
     ):
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
@@ -325,6 +339,15 @@ class SegmentedAttention(Module):
 
         next_cache = (k, v)
 
+        # context qkv for kv prepend
+        k_ctx = v_ctx = None
+        context_len = 0
+        if exists(context):
+            ctx = self.norm(context)
+            q_ctx, k_ctx, v_ctx = self.to_qkv(ctx).chunk(3, dim = -1)
+            q_ctx, k_ctx, v_ctx = map(self.split_heads, (q_ctx, k_ctx, v_ctx))
+            context_len = k_ctx.shape[-2]
+
         # take care of persistent memory key / values
 
         pmk, pmv = repeat(self.persistent_memory, 'kv h n d -> kv b h n d', b = batch)
@@ -332,8 +355,14 @@ class SegmentedAttention(Module):
         # relative positions
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        if exists(k_ctx):
+            _, k_ctx = self.rotary_emb.rotate_queries_with_cached_keys(q_ctx, k_ctx)
 
         # persistent memory
+
+        if exists(k_ctx):
+            k = cat((k_ctx, k), dim = -2)
+            v = cat((v_ctx, v), dim = -2)
 
         k = cat((pmk, k), dim = -2)
         v = cat((pmv, v), dim = -2)
@@ -341,7 +370,7 @@ class SegmentedAttention(Module):
         # prep flex attention
 
         if not exists(flex_attn_fn):
-            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding)
+            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding, context_len = context_len)
 
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
@@ -365,16 +394,17 @@ class SegmentedAttention(Module):
         flex_attn_fn: Callable | None = None,
         disable_flex_attn = False,
         output_gating = None,
-        cache = None
+        cache = None,
+        context = None
     ):
         is_inferencing = exists(cache)
 
         if is_inferencing:
             assert seq.shape[-2] == 1
-            return self.forward_inference(seq, cache, value_residual, output_gating = output_gating)
+            return self.forward_inference(seq, cache, value_residual, output_gating = output_gating, context = context)
 
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
-            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache)
+            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache, context = context)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
 
@@ -386,6 +416,10 @@ class SegmentedAttention(Module):
         # auto pad to multiple
 
         seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len, fold_into_batch = False)
+
+        # prepare context sequence aligned to segments
+        if exists(context):
+            context, _ = pad_and_segment_with_inverse(context, total_segment_len, fold_into_batch = False)
 
         # attention
 
@@ -406,13 +440,35 @@ class SegmentedAttention(Module):
 
         next_cache = tuple(map(inverse_segment, (k, v)))
 
+        # context qkv for kv prepend
+        if exists(context):
+            ctx = self.norm(context)
+            q_ctx, k_ctx, v_ctx = self.to_qkv(ctx).chunk(3, dim = -1)
+            q_ctx, k_ctx, v_ctx = map(self.split_heads, (q_ctx, k_ctx, v_ctx))
+        else:
+            k_ctx = v_ctx = None
+
         # relative positions
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        if exists(k_ctx):
+            _, k_ctx = self.rotary_emb.rotate_queries_with_cached_keys(q_ctx, k_ctx)
 
         # fold
 
         q, k, v = tuple(rearrange(t, 'b h (w n) d -> (b w) h n d', n = total_segment_len) for t in (q, k, v))
+        if exists(k_ctx):
+            k_ctx, v_ctx = tuple(rearrange(t, 'b h (w n) d -> (b w) h n d', n = total_segment_len) for t in (k_ctx, v_ctx))
+            # repeat context per window if needed
+            bw, _, _, _ = k.shape
+            bw_ctx, _, _, _ = k_ctx.shape
+            if bw_ctx != bw:
+                reps = bw // bw_ctx
+                k_ctx = k_ctx.repeat((reps, 1, 1, 1))
+                v_ctx = v_ctx.repeat((reps, 1, 1, 1))
+            ctx_len_per_window = k_ctx.shape[-2]
+        else:
+            ctx_len_per_window = 0
 
         # maybe sliding for cpu
 
@@ -436,7 +492,8 @@ class SegmentedAttention(Module):
             k_idx = rearrange(k_idx, 'w j -> w 1 j')
 
             sliding_mask = (q_idx - k_idx) <= total_segment_len
-            sliding_mask = F.pad(sliding_mask, (self.num_persist_mem_tokens, 0), value = True)
+            left_pad = self.num_persist_mem_tokens + ctx_len_per_window
+            sliding_mask = F.pad(sliding_mask, (left_pad, 0), value = True)
 
             sliding_mask = repeat(sliding_mask, 'w i j -> (b w) 1 i j', b = batch)
             attend_kwargs.update(mask = sliding_mask)
@@ -446,6 +503,10 @@ class SegmentedAttention(Module):
         pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
 
         # persistent memory
+
+        if exists(k_ctx):
+            k = cat((k_ctx, k), dim = -2)
+            v = cat((v_ctx, v), dim = -2)
 
         k = cat((pmk, k), dim = -2)
         v = cat((pmv, v), dim = -2)
@@ -478,7 +539,6 @@ class MemoryAsContextTransformer(Module):
         depth,
         segment_len,
         neural_memory_segment_len = None,
-        neural_mem_gate_attn_output = False,
         neural_memory_add_value_residual = False,
         num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
@@ -562,7 +622,7 @@ class MemoryAsContextTransformer(Module):
             mem_hyper_conn = None
 
             if layer in neural_memory_layers:
-                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output)
+                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = True)
 
                 if not is_first and neural_memory_qkv_receives_diff_views:
                     num_layer_choices = (layer - 1) * 4 + 1 # for each layer, have memory input select from attn inp, attn out, ff inp, and ff out - plus one for the current point in the residual stream (memory input)
@@ -601,10 +661,6 @@ class MemoryAsContextTransformer(Module):
         self.norm = nn.RMSNorm(dim)
 
         self.to_logits = LinearNoBias(dim, num_tokens)
-
-        # whether to gate the attention output with the retrieved memories
-
-        self.gate_attn_output = neural_mem_gate_attn_output
 
         # zero for maybe aux loss + device
 
@@ -757,15 +813,22 @@ class MemoryAsContextTransformer(Module):
         is_inferencing = exists(cache)
 
         if not exists(cache):
-            cache = (seq_len_with_mem - 1, None, None)
+            cache = (seq_len_with_mem - 1, None, None, None)
 
-        inference_seq_index, kv_caches, neural_mem_caches = cache
+        # unpack cache
+        if len(cache) == 3: # backwards compatibility or init
+            inference_seq_index, kv_caches, neural_mem_caches = cache
+            neural_mem_input_buffers = None
+        else:
+            inference_seq_index, kv_caches, neural_mem_caches, neural_mem_input_buffers = cache
 
         kv_caches = iter(default(kv_caches, []))
         neural_mem_caches = iter(default(neural_mem_caches, []))
+        neural_mem_input_buffers = iter(default(neural_mem_input_buffers, []))
 
         next_kv_caches = []
         next_neural_mem_caches = []
+        next_neural_mem_input_buffers = []
 
         # value residual
 
@@ -792,8 +855,7 @@ class MemoryAsContextTransformer(Module):
         for mem_hyper_conn, attn_hyper_conn, ff_hyper_conn, mem_qkv_layer_selector, mem, attn, ff in self.layers:
 
             retrieved = None
-            attn_out_gates = None
-            next_neural_mem_cache = None
+            mem_state_after_retrieve = None
 
             # maybe neural memory
 
@@ -812,19 +874,33 @@ class MemoryAsContextTransformer(Module):
 
                     qkv_mem_input = einsum(layers_to_choose_from, selected, 'l b n d, v b n l -> v b n d')
 
-                retrieved, next_neural_mem_cache = mem.forward(
+                # handle buffering for inference query
+                if is_inferencing:
+                    input_buffer = next(neural_mem_input_buffers, None)
+                    if input_buffer is None or divisible_by(inference_seq_index, segment_len):
+                        input_buffer = mem_input
+                    else:
+                        input_buffer = cat((input_buffer, mem_input), dim = -2)
+
+                    retrieval_query = input_buffer
+                    next_neural_mem_input_buffers.append(input_buffer)
+
+                    if not exists(mem_qkv_layer_selector):
+                        qkv_mem_input = stack((retrieval_query, retrieval_query, retrieval_query))
+                    else:
+                        qkv_mem_input = stack((retrieval_query, retrieval_query, retrieval_query))
+
+                retrieved, mem_state_after_retrieve = mem.forward_retrieve_only(
                     qkv_mem_input,
-                    state = next(neural_mem_caches, None),
-                    prev_weights = mem_weight_residual
+                    state = next(neural_mem_caches, None)
                 )
 
-                if self.neural_mem_weight_residual:
-                    mem_weight_residual = next_neural_mem_cache.updates
+                # no residual add; p_l will be provided to attention as context
 
-                if self.gate_attn_output:
-                    attn_out_gates = retrieved.sigmoid()
-                else:
-                    x = add_residual(retrieved)
+            else:
+                # consume buffer iterator even if mem doesn't exist to keep aligned? 
+                # No, layers list structure is fixed.
+                pass
 
             # attention
 
@@ -835,10 +911,10 @@ class MemoryAsContextTransformer(Module):
             attn_out, (values, next_kv_cache) = attn(
                 attn_in,
                 value_residual = value_residual,
-                disable_flex_attn = disable_flex_attn,
+                disable_flex_attn = True if exists(retrieved) else disable_flex_attn,
                 flex_attn_fn = flex_attn_fn,
-                output_gating = attn_out_gates,
-                cache = next(kv_caches, None)
+                cache = next(kv_caches, None),
+                context = retrieved if exists(retrieved) else None
             )
 
             mem_input_layers.append(attn_out)
@@ -850,7 +926,20 @@ class MemoryAsContextTransformer(Module):
             # caches
 
             next_kv_caches.append(next_kv_cache)
-            next_neural_mem_caches.append(next_neural_mem_cache)
+            if exists(mem):
+                updated_mem_state, _ = mem.forward_store_only(
+                    attn_out,
+                    state = mem_state_after_retrieve,
+                    prev_weights = mem_weight_residual,
+                    return_surprises = False
+                )
+
+                next_neural_mem_caches.append(updated_mem_state)
+
+                if self.neural_mem_weight_residual:
+                    mem_weight_residual = updated_mem_state.updates
+            else:
+                next_neural_mem_caches.append(None)
 
             # feedforward
 
@@ -882,7 +971,8 @@ class MemoryAsContextTransformer(Module):
             next_cache = (
                 inference_seq_index + 1,
                 next_kv_caches,
-                next_neural_mem_caches
+                next_neural_mem_caches,
+                next_neural_mem_input_buffers # Add buffers to cache
             )
 
             is_longterm_mem = self.seq_index_is_longterm(inference_seq_index)

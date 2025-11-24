@@ -2,9 +2,35 @@
 
 <img src="./fig1.png" width="400px"></img>
 
-## Titans - Pytorch
+## Titans - Pytorch (Paper-Aligned Fork)
 
-Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch. Will also contain some explorations into architectures beyond their simple 1-4 layer MLP for the neural memory module, if it works well to any degree.
+Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch.
+
+**Note:** This fork diverges from the original repository to strictly follow the **MAC (Memory As Context)** architecture described in the paper. While the original implementation explores experimental variations (like residual memory mixing), this fork aims for architectural correctness based on the paper's specifications.
+
+### Key Architectural Alignments
+
+Below are the critical changes made to align with the MAC architecture:
+
+1.  **Memory as Context (Concat instead of Residual)**
+
+    - **Paper:** The long-term memory $p_L$ serves as context for the current segment.
+    - **Implementation:** The retrieved memory is **prepended** to the attention Key/Values as context. It is _not_ added as a residual to the input, and it is _ephemeral_ (not stored in the KV cache).
+
+2.  **Strict Segment-wise Operation**
+
+    - **Retrieval:** Enforced to use only **committed weights** from the previous segment. Uncommitted updates within the current segment are ignored during retrieval to ensure $p_L$ remains fixed and stable for the entire segment.
+    - **Storage:** Explicitly separated `forward_store_only` path to handle memory updates independently from retrieval, preserving partial chunks correctly.
+
+3.  **Inference Consistency (Segment Buffering)**
+
+    - **Issue:** Standard token-by-token autoregressive decoding provides only 1 token of information to the memory, degrading performance compared to the training phase where the memory sees a full segment.
+    - **Solution:** Implemented **variable-length query buffering**. During inference, the model buffers inputs within the current segment (growing from 1 to `segment_len`). This ensures the memory module receives the same "view" of the segment as it does during training, resetting only at segment boundaries.
+
+4.  **Context-Aware Flex Attention**
+    - Updated masking logic to support `flex_attention` even when $p_L$ context is present during training, maintaining training speed without sacrificing architectural correctness.
+
+---
 
 ## Appreciation
 

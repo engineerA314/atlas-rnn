@@ -902,12 +902,96 @@ class NeuralMemory(Module):
 
         return values[:, :seq_len]
 
-    def forward(
+    def _derive_retrieval_weights(
+        self,
+        *,
+        batch: int,
+        is_single_token: bool,
+        weights: dict[str, Tensor] | None,
+        past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None,
+        updates: dict[str, Tensor] | None
+    ):
+        def ensure_single_token(tensor_dict):
+            if not is_single_token:
+                return tensor_dict
+            return rearrange_dict_values(tensor_dict, 'b ... -> b 1 ...')
+
+        if is_single_token and exists(past_state):
+            last_update, _ = past_state
+            if exists(last_update):
+                return ensure_single_token(last_update)
+
+        if exists(updates):
+            return updates
+
+        if exists(weights):
+            return ensure_single_token(weights)
+
+        init_weights = self.init_weights(batch)
+        return ensure_single_token(init_weights)
+
+    def _normalize_seq_shape(self, seq):
+        if isinstance(seq, (tuple, list)):
+            seq = torch.stack(seq)
+
+        return seq
+
+    def _maybe_add_seq_len_dim(self, seq):
+        if seq.ndim == 2:
+            return rearrange(seq, 'b d -> b 1 d')
+        return seq
+
+    def forward_retrieve_only(
         self,
         seq,
-        store_seq = None,
         state: NeuralMemState | None = None,
-        detach_mem_state = False,
+        detach_mem_state = False
+    ):
+        is_multi_input = self.qkv_receives_diff_views
+        seq = self._normalize_seq_shape(seq)
+
+        if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
+            seq = rearrange(seq, '... b d -> ... b 1 d')
+
+        if not exists(state):
+            state = (0, None, None, None, None)
+
+        seq_index, weights, cache_store_seq, past_state, updates = state
+
+        if is_multi_input:
+            retrieve_seq = seq[0]
+        else:
+            retrieve_seq = seq
+
+        # strict MAC: retrieval must use committed weights only (ignore uncommitted updates)
+        batch = retrieve_seq.shape[0]
+        if not exists(weights):
+            retrieval_weights = self.init_weights(batch)
+        else:
+            retrieval_weights = weights
+
+        retrieved = self.retrieve_memories(
+            retrieve_seq,
+            retrieval_weights
+        )
+
+        next_state = NeuralMemState(
+            seq_index,
+            weights,
+            cache_store_seq,
+            past_state,
+            updates
+        )
+
+        if detach_mem_state:
+            next_state = mem_state_detach(next_state)
+
+        return retrieved, next_state
+
+    def forward_store_only(
+        self,
+        store_seq,
+        state: NeuralMemState | None = None,
         prev_weights = None,
         store_mask: Tensor | None = None,
         return_surprises = False,
@@ -915,44 +999,38 @@ class NeuralMemory(Module):
     ):
         is_multi_input = self.qkv_receives_diff_views
 
-        # handle single token
-
-        if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
-            seq = rearrange(seq, '... b d -> ... b 1 d')
-
-        is_single_token = seq.shape[-2] == 1
-
-        # if different views for qkv, then
-
-        if is_multi_input:
-            retrieve_seq, seq = seq[0], seq[1:]
-        else:
-            retrieve_seq = seq
-
-        # handle previous state init
-
         if not exists(state):
             state = (0, None, None, None, None)
 
         seq_index, weights, cache_store_seq, past_state, updates = state
 
-        # store
+        store_seq = self._normalize_seq_shape(store_seq) if exists(store_seq) else store_seq
 
-        store_seq = default(store_seq, seq)
+        if is_multi_input:
+            if store_seq.ndim == 3:
+                store_seq = rearrange(store_seq, 'b n d -> 1 b n d')
 
-        # take care of cache
+            if store_seq.ndim == 4 and store_seq.shape[0] < 2:
+                store_seq = store_seq.expand(2, -1, -1, -1)
+        else:
+            store_seq = self._maybe_add_seq_len_dim(store_seq)
 
         if exists(cache_store_seq):
             store_seq = safe_cat((cache_store_seq, store_seq))
 
-        # compute split sizes of sequence
-        # for now manually update weights to last update at the correct boundaries
+        if not exists(store_seq):
+            return NeuralMemState(seq_index, weights, cache_store_seq, past_state, updates), None
 
-        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, default(ttt_batch_size, self.batch_size)
+        if is_multi_input:
+            stats_seq = store_seq[0]
+        else:
+            stats_seq = store_seq
+
+        store_seq_len = stats_seq.shape[-2]
+        chunk_size = self.chunk_size
+        batch_size = default(ttt_batch_size, self.batch_size)
 
         need_update_weights = exists(batch_size)
-
-        # determine split sizes and when to update
 
         if need_update_weights:
             update_after_final_store = divisible_by(seq_index + store_seq_len, batch_size)
@@ -1047,25 +1125,71 @@ class NeuralMemory(Module):
 
         next_neural_mem_state = next_neural_mem_state._replace(updates = updates)
 
-        # retrieve
+        if not return_surprises:
+            return next_neural_mem_state, None
 
-        if is_single_token:
-            last_update, _ = next_neural_mem_state.states
-            updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
+        return next_neural_mem_state, surprises
+
+    def forward(
+        self,
+        seq,
+        store_seq = None,
+        state: NeuralMemState | None = None,
+        detach_mem_state = False,
+        prev_weights = None,
+        store_mask: Tensor | None = None,
+        return_surprises = False,
+        ttt_batch_size: int | None = None,
+        retrieve_before_store: bool = False
+    ):
+        if retrieve_before_store:
+            return self.forward_retrieve_only(
+                seq,
+                state = state,
+                detach_mem_state = detach_mem_state
+            )
+
+        seq = self._normalize_seq_shape(seq)
+        is_multi_input = self.qkv_receives_diff_views
+
+        if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
+            seq = rearrange(seq, '... b d -> ... b 1 d')
+
+        if is_multi_input:
+            retrieve_seq, seq_for_store = seq[0], seq[1:]
+        else:
+            retrieve_seq = seq
+            seq_for_store = seq
+
+        next_state, surprises = self.forward_store_only(
+            store_seq = default(store_seq, seq_for_store),
+            state = state,
+            prev_weights = prev_weights,
+            store_mask = store_mask,
+            return_surprises = return_surprises,
+            ttt_batch_size = ttt_batch_size
+        )
+
+        batch = retrieve_seq.shape[0]
+        is_single_token = retrieve_seq.shape[-2] == 1
+
+        retrieval_weights = self._derive_retrieval_weights(
+            batch = batch,
+            is_single_token = is_single_token,
+            weights = next_state.weights,
+            past_state = next_state.states,
+            updates = next_state.updates
+        )
 
         retrieved = self.retrieve_memories(
             retrieve_seq,
-            updates
+            retrieval_weights
         )
 
-        # maybe detach
-
         if detach_mem_state:
-            next_neural_mem_state = mem_state_detach(next_neural_mem_state)
-
-        # returning
+            next_state = mem_state_detach(next_state)
 
         if not return_surprises:
-            return retrieved, next_neural_mem_state
+            return retrieved, next_state
 
-        return retrieved, next_neural_mem_state, surprises
+        return retrieved, next_state, surprises
