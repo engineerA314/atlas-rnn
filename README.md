@@ -1,6 +1,10 @@
+<img src="./fig1.png" width="400px"></img>
+
 <img src="./fig2.png" width="400px"></img>
 
-<img src="./fig1.png" width="400px"></img>
+<img src="./fig3.png" width="400px"></img>
+
+<img src="./fig4.png" width="400px"></img>
 
 ## Titans - Pytorch (Paper-Aligned Fork)
 
