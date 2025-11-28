@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from einops import rearrange
-from titans_pytorch.implicit_mlp_attention import ImplicitMLPAttention
+from atlas_pytorch.implicit_mlp_attention import ImplicitMLPAttention
 
 # constants
 

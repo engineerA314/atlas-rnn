@@ -1,7 +1,8 @@
 """
-Training script for MAG (Memory as Gate) Transformer with Atlas.
+Training script for AtlasLMM (Pure Atlas - Long-term Memory Module only).
 
-MAG uses sliding window attention + OmegaNeuralMemory combined via gating.
+AtlasLMM uses only OmegaNeuralMemory without attention.
+Tests the memory module's standalone capability as a sequence model.
 Supports Omega rule, polynomial features, and Muon optimizer.
 """
 
@@ -18,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from adam_atan2_pytorch import AdoptAtan2
 
 from atlas_pytorch import (
-    MemoryAsGateTransformer,
+    AtlasLMM,
     MemoryMLP,
     MemoryAttention
 )
@@ -40,13 +41,11 @@ SEQ_LEN = 512
 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
-NEURAL_MEM_LAYERS = (2, 4, 6)           # layers with neural memory
 NEURAL_MEM_MOMENTUM = True
 NEURAL_MEM_MOMENTUM_ORDER = 1
 NEURAL_MEM_QK_NORM = True
 NEURAL_MEM_MAX_LR = 1e-1
 USE_MEM_ATTENTION_MODEL = False
-WINDOW_SIZE = 64                         # sliding window size
 
 # Atlas-specific settings
 OMEGA_WINDOW = 2                         # context window for Omega rule
@@ -57,8 +56,8 @@ USE_MUON_OPTIMIZER = False               # use Muon optimizer for memory
 
 # experiment related
 
-PROJECT_NAME = 'atlas-mag-transformer'
-RUN_NAME = f'mag - window {WINDOW_SIZE}, omega {OMEGA_WINDOW}, layers {NEURAL_MEM_LAYERS}'
+PROJECT_NAME = 'atlas-lmm'
+RUN_NAME = f'atlas-lmm - omega {OMEGA_WINDOW}, depth 8'
 WANDB_ONLINE = False
 
 # perf related
@@ -98,15 +97,13 @@ else:
         depth = NEURAL_MEMORY_DEPTH
     )
 
-# instantiate memory-as-gate transformer with Atlas
+# instantiate AtlasLMM (pure memory model)
 
-model = MemoryAsGateTransformer(
+model = AtlasLMM(
     num_tokens = 256,
     dim = 384,
     depth = 8,
-    window_size = WINDOW_SIZE,
     num_persist_mem_tokens = NUM_PERSIST_MEM,
-    neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_model = neural_memory_model,
     # Atlas-specific kwargs
     omega_window = OMEGA_WINDOW,

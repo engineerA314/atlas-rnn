@@ -69,7 +69,7 @@ from hyper_connections import get_init_and_expand_reduce_stream_functions
 
 # proposed neural memory
 
-from titans_pytorch.neural_memory import NeuralMemory
+from atlas_pytorch.neural_memory import NeuralMemory
 
 # constants
 

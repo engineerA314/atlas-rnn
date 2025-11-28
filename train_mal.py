@@ -1,8 +1,9 @@
 """
-Training script for MAL (Memory as Layer) Transformer.
+Training script for MAL (Memory as Layer) Transformer with Atlas.
 
-MAL applies neural memory as a layer before sliding window attention.
-Structure: Input -> Memory Layer -> Attention -> Output
+MAL uses OmegaNeuralMemory as a layer before sliding window attention.
+Memory compresses context, then attention operates on compressed representation.
+Supports Omega rule, polynomial features, and Muon optimizer.
 """
 
 import random
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from adam_atan2_pytorch import AdoptAtan2
 
-from titans_pytorch import (
+from atlas_pytorch import (
     MemoryAsLayerTransformer,
     MemoryMLP,
     MemoryAttention
@@ -40,18 +41,25 @@ SEQ_LEN = 512
 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
-NEURAL_MEM_LAYERS = (1, 2, 3, 4, 5, 6, 7, 8)  # all layers have memory before attention
+NEURAL_MEM_LAYERS = (2, 4, 6)           # layers with neural memory
 NEURAL_MEM_MOMENTUM = True
 NEURAL_MEM_MOMENTUM_ORDER = 1
 NEURAL_MEM_QK_NORM = True
 NEURAL_MEM_MAX_LR = 1e-1
 USE_MEM_ATTENTION_MODEL = False
-WINDOW_SIZE = 64                              # sliding window size
+WINDOW_SIZE = 64                         # sliding window size
+
+# Atlas-specific settings
+OMEGA_WINDOW = 2                         # context window for Omega rule
+USE_OMEGA_GATE = False                   # use learned U gate for Omega
+POLY_DEGREE = 1                          # polynomial feature degree
+POLY_MODE = 'off'                        # 'off', 'elementwise', 'tensor'
+USE_MUON_OPTIMIZER = False               # use Muon optimizer for memory
 
 # experiment related
 
-PROJECT_NAME = 'titans-mal-transformer'
-RUN_NAME = f'mal - window {WINDOW_SIZE}, memory in all layers'
+PROJECT_NAME = 'atlas-mal-transformer'
+RUN_NAME = f'mal - window {WINDOW_SIZE}, omega {OMEGA_WINDOW}, layers {NEURAL_MEM_LAYERS}'
 WANDB_ONLINE = False
 
 # perf related
@@ -91,7 +99,7 @@ else:
         depth = NEURAL_MEMORY_DEPTH
     )
 
-# instantiate memory-as-layer transformer
+# instantiate memory-as-layer transformer with Atlas
 
 model = MemoryAsLayerTransformer(
     num_tokens = 256,
@@ -101,6 +109,12 @@ model = MemoryAsLayerTransformer(
     num_persist_mem_tokens = NUM_PERSIST_MEM,
     neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_model = neural_memory_model,
+    # Atlas-specific kwargs
+    omega_window = OMEGA_WINDOW,
+    use_omega_gate = USE_OMEGA_GATE,
+    poly_degree = POLY_DEGREE,
+    poly_mode = POLY_MODE,
+    use_muon_optimizer = USE_MUON_OPTIMIZER,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,

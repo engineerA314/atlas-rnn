@@ -1,18 +1,20 @@
 """
-Memory as Layer (MAL) Transformer and Pure Titans (LMM)
+Memory as Layer (MAL) Transformer and Pure Atlas (LMM) for Atlas
 
-From Titans paper Section 4.3:
+From Titans paper Section 4.3 + Atlas extensions:
 
 MAL:
 - Neural memory is used as a layer BEFORE attention
 - Memory compresses past/current context, then attention operates on compressed representation
 - Uses sliding window attention
-- Structure: x -> Memory -> Attention -> output
+- Structure: x -> OmegaNeuralMemory -> Attention -> output
+- Supports Omega rule and Muon optimizer
 
-Pure Titans (LMM):
-- Only uses neural long-term memory, no attention
+Pure Atlas (LMM):
+- Only uses OmegaNeuralMemory, no attention
 - Tests the memory module's standalone capability
 - From paper: "a long-term memory module should still be a powerful model even without short-term memory"
+- Supports Omega rule, polynomial features, and Muon optimizer
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 from x_transformers.attend import Attend
 
-from titans_pytorch.neural_memory import NeuralMemory
+from atlas_pytorch.omega import OmegaNeuralMemory
 
 # constants
 
@@ -196,17 +198,22 @@ class SlidingWindowAttention(Module):
         return out, next_cache
 
 
-# MAL Transformer
+# MAL Transformer with Atlas (OmegaNeuralMemory)
 
 class MemoryAsLayerTransformer(Module):
     """
-    Memory as Layer (MAL) architecture from Titans paper.
+    Memory as Layer (MAL) architecture from Titans paper with Atlas extensions.
     
     Memory is applied as a layer before attention:
-    x -> NeuralMemory -> SlidingWindowAttention -> output
+    x -> OmegaNeuralMemory -> SlidingWindowAttention -> output
     
     This is similar to hybrid architectures like H3 where
     recurrent models are stacked with attention.
+    
+    Atlas extensions:
+    - Supports omega_window > 1 for context memorization
+    - Supports polynomial feature mappings
+    - Supports Muon optimizer for memory updates
     """
     
     def __init__(
@@ -224,6 +231,12 @@ class MemoryAsLayerTransformer(Module):
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
         token_emb: Module | None = None,
+        # Atlas-specific kwargs
+        omega_window: int = 1,
+        use_omega_gate: bool = False,
+        poly_degree: int = 1,
+        poly_mode: str = 'off',
+        use_muon_optimizer: bool = False,
     ):
         super().__init__()
         
@@ -247,12 +260,20 @@ class MemoryAsLayerTransformer(Module):
             # neural memory layer (applied first)
             mem = None
             if layer in neural_memory_layers:
-                mem = NeuralMemory(
+                mem = OmegaNeuralMemory(
                     dim = dim,
                     chunk_size = 1,  # token-by-token, no segmentation
                     model = deepcopy(neural_memory_model) if exists(neural_memory_model) else None,
+                    omega_window = omega_window,
+                    use_omega_gate = use_omega_gate,
+                    poly_degree = poly_degree,
+                    poly_mode = poly_mode,
                     **neural_memory_kwargs
                 )
+                
+                # enable Muon optimizer if requested
+                if use_muon_optimizer:
+                    mem.use_muon_optimizer = True
             
             # sliding window attention (applied after memory)
             attn = SlidingWindowAttention(
@@ -320,7 +341,7 @@ class MemoryAsLayerTransformer(Module):
         return_cache = False,
     ):
         """
-        Forward pass for MAL.
+        Forward pass for MAL with Atlas (OmegaNeuralMemory).
         
         Args:
             x: input token ids (batch, seq_len)
@@ -386,17 +407,22 @@ class MemoryAsLayerTransformer(Module):
         return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
 
 
-# Pure Titans (LMM only)
+# Pure Atlas (LMM only) with OmegaNeuralMemory
 
-class TitansLMM(Module):
+class AtlasLMM(Module):
     """
-    Pure Titans - Long-term Memory Module only (no attention).
+    Pure Atlas - Long-term Memory Module only (no attention).
     
     From paper Section 4.3:
     "a long-term memory module should still be a powerful model 
     even without short-term memory (i.e., attention)"
     
-    This tests the neural memory's standalone capability as a sequence model.
+    This tests the OmegaNeuralMemory's standalone capability as a sequence model.
+    
+    Atlas extensions:
+    - Supports omega_window > 1 for context memorization
+    - Supports polynomial feature mappings
+    - Supports Muon optimizer for memory updates
     """
     
     def __init__(
@@ -410,6 +436,12 @@ class TitansLMM(Module):
         neural_memory_kwargs: dict = dict(),
         ff_mult = 4,
         token_emb: Module | None = None,
+        # Atlas-specific kwargs
+        omega_window: int = 1,
+        use_omega_gate: bool = False,
+        poly_degree: int = 1,
+        poly_mode: str = 'off',
+        use_muon_optimizer: bool = False,
     ):
         super().__init__()
         
@@ -431,12 +463,20 @@ class TitansLMM(Module):
         self.layers = ModuleList([])
         
         for _ in range(depth):
-            mem = NeuralMemory(
+            mem = OmegaNeuralMemory(
                 dim = dim,
                 chunk_size = 1,  # token-by-token
                 model = deepcopy(neural_memory_model) if exists(neural_memory_model) else None,
+                omega_window = omega_window,
+                use_omega_gate = use_omega_gate,
+                poly_degree = poly_degree,
+                poly_mode = poly_mode,
                 **neural_memory_kwargs
             )
+            
+            # enable Muon optimizer if requested
+            if use_muon_optimizer:
+                mem.use_muon_optimizer = True
             
             ff = FeedForward(dim = dim, mult = ff_mult)
             
@@ -491,7 +531,7 @@ class TitansLMM(Module):
         return_cache = False,
     ):
         """
-        Forward pass for LMM (Pure Titans).
+        Forward pass for AtlasLMM (Pure Atlas with OmegaNeuralMemory).
         
         Args:
             x: input token ids (batch, seq_len)

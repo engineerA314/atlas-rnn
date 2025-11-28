@@ -1,12 +1,13 @@
 """
-Memory as Gate (MAG) Transformer
+Memory as Gate (MAG) Transformer for Atlas
 
-From Titans paper Section 4.2:
+From Titans paper Section 4.2 + Atlas extensions:
 - Uses sliding window attention (SWA) as short-term memory
-- Uses neural memory module as long-term memory  
+- Uses OmegaNeuralMemory module as long-term memory (Atlas extension)
 - Combines both branches using a gating mechanism: o = V ⊕ M(x̃)
 - No segment-based operation (unlike MAC)
 - Persistent memory tokens prepended to sequence
+- Supports Omega rule and Muon optimizer for memory updates
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 from x_transformers.attend import Attend
 
-from titans_pytorch.neural_memory import NeuralMemory
+from atlas_pytorch.omega import OmegaNeuralMemory
 
 # constants
 
@@ -191,17 +192,22 @@ class SlidingWindowAttention(Module):
         return out, next_cache
 
 
-# MAG Transformer
+# MAG Transformer with Atlas (OmegaNeuralMemory)
 
 class MemoryAsGateTransformer(Module):
     """
-    Memory as Gate (MAG) architecture from Titans paper.
+    Memory as Gate (MAG) architecture from Titans paper with Atlas extensions.
     
     Two parallel branches:
     1. Sliding window attention (short-term memory)
-    2. Neural memory module (long-term memory)
+    2. OmegaNeuralMemory module (long-term memory with Omega rule)
     
     Combined via learned gating: output = attn_out ⊕ gate * mem_out
+    
+    Atlas extensions:
+    - Supports omega_window > 1 for context memorization
+    - Supports polynomial feature mappings
+    - Supports Muon optimizer for memory updates
     """
     
     def __init__(
@@ -219,6 +225,12 @@ class MemoryAsGateTransformer(Module):
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
         token_emb: Module | None = None,
+        # Atlas-specific kwargs
+        omega_window: int = 1,
+        use_omega_gate: bool = False,
+        poly_degree: int = 1,
+        poly_mode: str = 'off',
+        use_muon_optimizer: bool = False,
     ):
         super().__init__()
         
@@ -253,12 +265,20 @@ class MemoryAsGateTransformer(Module):
             gate = None
             
             if layer in neural_memory_layers:
-                mem = NeuralMemory(
+                mem = OmegaNeuralMemory(
                     dim = dim,
                     chunk_size = 1,  # token-by-token, no segmentation
                     model = deepcopy(neural_memory_model) if exists(neural_memory_model) else None,
+                    omega_window = omega_window,
+                    use_omega_gate = use_omega_gate,
+                    poly_degree = poly_degree,
+                    poly_mode = poly_mode,
                     **neural_memory_kwargs
                 )
+                
+                # enable Muon optimizer if requested
+                if use_muon_optimizer:
+                    mem.use_muon_optimizer = True
                 
                 # gating mechanism: combines attn and memory outputs
                 # paper: o = V ⊕ M(x̃) where ⊕ is non-linear gating
@@ -325,7 +345,7 @@ class MemoryAsGateTransformer(Module):
         return_cache = False,
     ):
         """
-        Forward pass for MAG.
+        Forward pass for MAG with Atlas (OmegaNeuralMemory).
         
         Args:
             x: input token ids (batch, seq_len)

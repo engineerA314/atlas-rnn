@@ -2,192 +2,223 @@
 
 <img src="./fig2.png" width="400px"></img>
 
-<img src="./fig3.png" width="400px"></img>
+## Atlas - Pytorch
 
-<img src="./fig4.png" width="400px"></img>
-
-## Titans - Pytorch (Paper-Aligned Fork)
-
-Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch.
-
-**Note:** This fork diverges from the original repository to strictly follow the architectures described in the paper. While the original implementation explores experimental variations (like residual memory mixing), this fork aims for architectural correctness based on the paper's specifications. This implementation includes all four variants proposed in the Titans paper:
-
-| Architecture          | Description           | Attention Type       | Memory Integration                    |
-| --------------------- | --------------------- | -------------------- | ------------------------------------- |
-| **MAC**               | Memory as Context     | Block/Sliding Window | Memory prepended as attention context |
-| **MAG**               | Memory as Gate        | Sliding Window       | Memory combined via learned gating    |
-| **MAL**               | Memory as Layer       | Sliding Window       | Memory applied before attention       |
-| **Pure Titans (LMM)** | Long-term Memory only | None                 | Standalone memory sequence model      |
-
-### Key Architectural Alignments
-
-Below are the critical changes made to align with the MAC architecture:
-
-1.  **Memory as Context (Concat instead of Residual)**
-
-    - **Paper:** The long-term memory $p_L$ serves as context for the current segment.
-    - **Implementation:** The retrieved memory is **prepended** to the attention Key/Values as context. It is _not_ added as a residual to the input, and it is _ephemeral_ (not stored in the KV cache).
-
-2.  **Strict Segment-wise Operation**
-
-    - **Retrieval:** Enforced to use only **committed weights** from the previous segment. Uncommitted updates within the current segment are ignored during retrieval to ensure $p_L$ remains fixed and stable for the entire segment.
-    - **Storage:** Explicitly separated `forward_store_only` path to handle memory updates independently from retrieval, preserving partial chunks correctly.
-
-3.  **Inference Consistency (Segment Buffering)**
-
-    - **Issue:** Standard token-by-token autoregressive decoding provides only 1 token of information to the memory, degrading performance compared to the training phase where the memory sees a full segment.
-    - **Solution:** Implemented **variable-length query buffering**. During inference, the model buffers inputs within the current segment (growing from 1 to `segment_len`). This ensures the memory module receives the same "view" of the segment as it does during training, resetting only at segment boundaries.
-
-4.  **Context-Aware Flex Attention**
-    - Updated masking logic to support `flex_attention` even when $p_L$ context is present during training, maintaining training speed without sacrificing architectural correctness.
-
----
-
-## Appreciation
-
-- [Eryk](https://github.com/sentialx) for sharing his early experimental results with me, positive for 2 layer MLP
-
-## Install
-
-```bash
-$ pip install titans-pytorch
-```
+Unofficial implementation of [Atlas](https://arxiv.org/abs/2505.23735) in Pytorch.
 
 ## Usage
 
+Install locally (this fork is not published to PyPI):
+
+```bash
+pip install -e .
+pip install -e ".[examples]"
+```
+
+Basic memory usage:
+
 ```python
 import torch
-from titans_pytorch import NeuralMemory
+from atlas_pytorch import NeuralMemory
 
 mem = NeuralMemory(
     dim = 384,
-    chunk_size = 64 # set to smaller chunk size for better perf on smaller sequence lengths (but more memory usage)
+    chunk_size = 64
 ).cuda()
 
 seq = torch.randn(2, 1024, 384).cuda()
 retrieved, mem_state = mem(seq)
-
 assert seq.shape == retrieved.shape
 ```
 
-### MAC (Memory as Context)
-
-Segment-based architecture where memory is prepended as context to attention.
+MAC transformer (Memory-As-Context):
 
 ```python
 import torch
-from titans_pytorch import MemoryAsContextTransformer
+from atlas_pytorch import MemoryAsContextTransformer
 
 transformer = MemoryAsContextTransformer(
     num_tokens = 256,
     dim = 256,
     depth = 2,
-    segment_len = 128,              # segment/window size
+    segment_len = 128,
     num_persist_mem_tokens = 4,
     num_longterm_mem_tokens = 16,
 )
 
-token_ids = torch.randint(0, 256, (1, 1023))
-
-loss = transformer(token_ids, return_loss = True)
+ids = torch.randint(0, 256, (1, 1023))
+loss = transformer(ids, return_loss = True)
 loss.backward()
 
 # after much training
-sampled = transformer.sample(token_ids[:, :4], 512)
+sampled = transformer.sample(ids[:, :4], 512)
 ```
 
-### MAG (Memory as Gate)
-
-Sliding window attention combined with neural memory via gating.
+MAG transformer (Memory-As-Gate) with Atlas:
 
 ```python
 import torch
-from titans_pytorch import MemoryAsGateTransformer
+from atlas_pytorch import MemoryAsGateTransformer
 
+# MAG: sliding window attention + neural memory combined via gating
 transformer = MemoryAsGateTransformer(
     num_tokens = 256,
     dim = 256,
-    depth = 2,
-    window_size = 64,               # sliding window size
+    depth = 4,
+    window_size = 64,
     num_persist_mem_tokens = 4,
+    neural_memory_layers = (1, 2, 3, 4),
+    # Atlas-specific options
+    omega_window = 2,           # context window for Omega rule
+    use_omega_gate = False,     # learned U gate
+    poly_degree = 2,            # polynomial features
+    poly_mode = 'elementwise',
+    use_muon_optimizer = False, # Muon for memory updates
 )
 
-token_ids = torch.randint(0, 256, (1, 1023))
-
-loss = transformer(token_ids, return_loss = True)
+ids = torch.randint(0, 256, (1, 512))
+loss = transformer(ids, return_loss = True)
 loss.backward()
 
-sampled = transformer.sample(token_ids[:, :4], 512)
+# sampling with cache
+sampled = transformer.sample(ids[:, :4], 256, use_cache = True)
 ```
 
-### MAL (Memory as Layer)
-
-Memory applied as a layer before sliding window attention.
+MAL transformer (Memory-As-Layer) with Atlas:
 
 ```python
 import torch
-from titans_pytorch import MemoryAsLayerTransformer
+from atlas_pytorch import MemoryAsLayerTransformer
 
+# MAL: memory layer applied BEFORE attention
 transformer = MemoryAsLayerTransformer(
     num_tokens = 256,
     dim = 256,
-    depth = 2,
-    window_size = 64,               # sliding window size
+    depth = 4,
+    window_size = 64,
     num_persist_mem_tokens = 4,
+    neural_memory_layers = (1, 2, 3, 4),
+    # Atlas-specific options
+    omega_window = 2,
+    use_omega_gate = False,
+    poly_degree = 2,
+    poly_mode = 'elementwise',
+    use_muon_optimizer = False,
 )
 
-token_ids = torch.randint(0, 256, (1, 1023))
-
-loss = transformer(token_ids, return_loss = True)
+ids = torch.randint(0, 256, (1, 512))
+loss = transformer(ids, return_loss = True)
 loss.backward()
 
-sampled = transformer.sample(token_ids[:, :4], 512)
+sampled = transformer.sample(ids[:, :4], 256, use_cache = True)
 ```
 
-### Pure Titans (LMM)
-
-Long-term memory module only, without attention.
+AtlasLMM (Pure Atlas - Long-term Memory only):
 
 ```python
 import torch
-from titans_pytorch import TitansLMM
+from atlas_pytorch import AtlasLMM
 
-model = TitansLMM(
+# Pure memory model without attention
+model = AtlasLMM(
     num_tokens = 256,
     dim = 256,
-    depth = 4,                      # number of memory layers
+    depth = 4,
     num_persist_mem_tokens = 4,
+    # Atlas-specific options
+    omega_window = 2,
+    use_omega_gate = False,
+    poly_degree = 2,
+    poly_mode = 'elementwise',
+    use_muon_optimizer = False,
 )
 
-token_ids = torch.randint(0, 256, (1, 1023))
-
-loss = model(token_ids, return_loss = True)
+ids = torch.randint(0, 256, (1, 512))
+loss = model(ids, return_loss = True)
 loss.backward()
 
-sampled = model.sample(token_ids[:, :4], 512)
+sampled = model.sample(ids[:, :4], 256, use_cache = True)
 ```
 
-## Experiments
+## Train (OmegaNet / Atlas)
+
+This fork supports both OmegaNet (Omega rule with SGD) and Atlas (Omega + Muon) from the paper.
+
+### MAC architecture (Memory-As-Context)
 
 ```bash
-$ pip install .[examples]
+python train_mac.py --model omeganet --omega-window 2 --poly-mode elementwise --poly-degree 2
 ```
 
-Training scripts are provided for each architecture:
+With Muon optimizer (Atlas):
 
 ```bash
-# MAC (Memory as Context)
-$ python train_mac.py
-
-# MAG (Memory as Gate)
-$ python train_mag.py
-
-# MAL (Memory as Layer)
-$ python train_mal.py
-
-# Pure Titans (LMM only)
-$ python train_titans.py
+python train_mac.py --model atlas --omega-window 2 --poly-mode elementwise --poly-degree 2
 ```
+
+### MAG architecture (Memory-As-Gate)
+
+```bash
+python train_mag.py
+```
+
+Configure in script: `OMEGA_WINDOW`, `POLY_MODE`, `POLY_DEGREE`, `USE_MUON_OPTIMIZER`
+
+### MAL architecture (Memory-As-Layer)
+
+```bash
+python train_mal.py
+```
+
+### AtlasLMM (Pure Memory Model)
+
+```bash
+python train_atlas.py
+```
+
+### Optional flags (for train_mac.py)
+
+- `--use-omega-gate` to enable chunk-level U-gating
+- `--poly-mode {off,elementwise,tensor}`
+- `--poly-degree <int>`
+
+### Polynomial features (`poly-mode`)
+
+Atlas/OmegaNet can expand keys and queries with polynomial feature mappings to improve capacity and capture higher-order interactions:
+
+- `off`: disables polynomial lifting; uses raw linear projections.
+- `elementwise`: applies element-wise powers up to degree `g` and sums them, i.e. `x -> sum_{i=1..g} x^i`. This preserves the original dimensionality and is cheap (O(d)).
+- `tensor`: builds degree‑2 interaction features via the outer product `x ⊗ x`, concatenates `[x, vec(x⊗x)]`, then applies a fixed, non‑trainable random projection back to the original dimension. For practicality, higher degrees fall back to degree‑2 interactions.
+
+Why this design:
+
+- Capacity: Polynomial lifting increases the effective input dimension, improving the number of key–value associations a fixed-size memory can store (see paper’s capacity bounds).
+- Kernel view: Elementwise powers offer a Taylor‑like expansion that serves as a practical path towards richer kernels (e.g., approximating the exponential kernel behind softmax attention).
+- Efficiency: `elementwise` adds minimal overhead; `tensor` captures pairwise interactions while controlling dimensional blow‑up via a fixed projection.
+
+Implementation notes:
+
+- The mapping is applied to keys (always) and to queries via a wrapper, so storage and retrieval share the same lifted space.
+- The random projection in `tensor` mode is cached per device/dimension, non‑trainable, and keeps compute/memory bounded.
+- Recommended defaults:
+  - General: `--poly-mode elementwise --poly-degree 2`
+  - For stronger interactions (more compute): `--poly-mode tensor`
+
+## Tests
+
+```bash
+pytest -q tests/test_atlas.py
+```
+
+## Provenance / Attribution
+
+This repository originates from the excellent Titans implementation by lucidrains and was adapted to strictly follow the paper-aligned MAC (Memory-As-Context) semantics, then extended with OmegaNet and Atlas options:
+
+- Original project: [lucidrains/titans-pytorch](https://github.com/lucidrains/titans-pytorch)
+- Paper-aligned MAC fixes (by Junyoung Park): committed-weights retrieval, segment-buffered inference queries, ephemeral context handling, and MAG/MAL/LMM architectural implementations aligned with Titans paper.
+- Atlas extension (by Junyoung Park): Omega rule with sliding window, polynomial feature mappings (`poly-mode`), Muon toggle for Atlas, CLI for switching between `titans`/`omeganet`/`atlas`, and a comprehensive test suite for Omega/Atlas behavior.
+
+This fork aims to provide a unified codebase for researching Titans and Atlas architectures with high fidelity to their respective papers.
 
 ## Citations
 

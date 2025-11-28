@@ -10,11 +10,14 @@ from torch.utils.data import DataLoader, Dataset
 
 from adam_atan2_pytorch import AdoptAtan2
 
-from titans_pytorch import (
+from atlas_pytorch import (
     MemoryAsContextTransformer,
     MemoryMLP,
     MemoryAttention
 )
+import atlas_pytorch.mac_transformer as mac
+from atlas_pytorch.omega import OmegaNeuralMemory
+import argparse
 
 # constants
 
@@ -82,6 +85,25 @@ def decode_token(token):
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
 
+# -----------------------------------------------------------------------------
+# CLI to select model variant: 'titans' (baseline), 'omeganet', or 'atlas'
+# OmegaNet = OmegaNeuralMemory with SGD; Atlas = OmegaNeuralMemory + Muon
+# -----------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--model', type=str, default='titans', choices=['titans', 'omeganet', 'atlas'])
+parser.add_argument('--omega-window', type=int, default=2)
+parser.add_argument('--use-omega-gate', action='store_true', default=False)
+parser.add_argument('--poly-mode', type=str, default='elementwise', choices=['off', 'elementwise', 'tensor'])
+parser.add_argument('--poly-degree', type=int, default=2)
+args, _ = parser.parse_known_args()
+
+MODEL_TYPE = args.model
+OMEGA_WINDOW = args.omega_window
+USE_OMEGA_GATE = args.use_omega_gate
+POLY_MODE = args.poly_mode
+POLY_DEGREE = args.poly_degree
+
 # memory model
 
 if USE_MEM_ATTENTION_MODEL:
@@ -95,6 +117,35 @@ else:
     )
 
 # instantiate memory-as-context transformer
+
+# swap in Omega memory for omeganet / atlas
+if MODEL_TYPE in ('omeganet', 'atlas'):
+    mac.NeuralMemory = OmegaNeuralMemory
+
+# base kwargs shared across variants
+neural_memory_kwargs = dict(
+    dim_head = 64,
+    heads = 4,
+    attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
+    qk_rmsnorm = NEURAL_MEM_QK_NORM,
+    momentum = NEURAL_MEM_MOMENTUM,
+    momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
+    default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
+    use_accelerated_scan = USE_ACCELERATED_SCAN,
+    per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR,
+    spectral_norm_surprises = NEURAL_MEM_SPEC_NORM_SURPRISES
+)
+
+# add omega-specific knobs for omeganet / atlas
+if MODEL_TYPE in ('omeganet', 'atlas'):
+    neural_memory_kwargs.update(
+        dict(
+            omega_window = OMEGA_WINDOW,
+            use_omega_gate = USE_OMEGA_GATE,
+            poly_mode = POLY_MODE,
+            poly_degree = POLY_DEGREE
+        )
+    )
 
 model = MemoryAsContextTransformer(
     num_tokens = 256,
@@ -111,19 +162,15 @@ model = MemoryAsContextTransformer(
     use_flex_attn = USE_FLEX_ATTN,
     sliding_window_attn = SLIDING_WINDOWS,
     neural_memory_model = neural_memory_model,
-    neural_memory_kwargs = dict(
-        dim_head = 64,
-        heads = 4,
-        attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
-        qk_rmsnorm = NEURAL_MEM_QK_NORM,
-        momentum = NEURAL_MEM_MOMENTUM,
-        momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
-        default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
-        use_accelerated_scan = USE_ACCELERATED_SCAN,
-        per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR,
-        spectral_norm_surprises = NEURAL_MEM_SPEC_NORM_SURPRISES
-    )
+    neural_memory_kwargs = neural_memory_kwargs
 ).cuda()
+
+# enable Muon optimizer for Atlas by toggling flag on each memory layer
+if MODEL_TYPE == 'atlas':
+    for layer in model.layers:
+        mem = layer[4]
+        if mem is not None:
+            mem.use_muon_optimizer = True
 
 # prepare enwik8 data
 

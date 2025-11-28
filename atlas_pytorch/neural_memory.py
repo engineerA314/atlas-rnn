@@ -17,7 +17,7 @@ from tensordict import TensorDict
 
 from assoc_scan import AssocScan
 
-from titans_pytorch.memory_models import(
+from atlas_pytorch.memory_models import(
     MemoryMLP,
     ResidualNorm
 )
@@ -971,7 +971,7 @@ class NeuralMemory(Module):
         # strict MAC: retrieval must use committed weights only (ignore uncommitted updates)
         batch = retrieve_seq.shape[0]
         # expand weights across time chunks if they do not already carry a time dimension
-        def ensure_time_expanded(w: dict[str, Tensor]):
+        def ensure_time_expanded(w):
             first_w = next(iter(w.values()))
             first_init_shape = self.init_weight_shape[0]
             has_time_dim = first_w.ndim > len(first_init_shape)
