@@ -2,65 +2,272 @@
 
 <img src="./fig2.png" width="400px"></img>
 
-## Atlas - Pytorch
+## Atlas-RNN - Pytorch
 
-Unofficial implementation of [Atlas](https://arxiv.org/abs/2505.23735) in Pytorch.
+**Pure RNN-form implementation of Titans and Atlas (OmegaNet) memory architectures.**
 
-## Usage
+This project derives the explicit RNN update rules from the implicit gradient descent formulation in Titans and Atlas papers, enabling efficient training without per-sample gradient computation via `torch.func`.
 
-Install locally (this fork is not published to PyPI):
+## Key Insight: From Implicit GD to Explicit RNN
+
+The Titans and Atlas papers show that linear attention can be viewed as implicit gradient descent on a "surprise" loss. We reverse this insight: by explicitly computing the gradient of the MSE loss, we derive closed-form RNN update rules that are mathematically equivalent but computationally more efficient.
+
+### Mathematical Derivation
+
+#### 1. Internal Objective (Attentional Bias / Surprise)
+
+For a memory state \( S \) and input key-value pair \( (k_t, v_t) \):
+
+```
+ℓ_t(S) = ½ ‖S φ_t − v_t‖²
+```
+
+where \( φ_t = φ(k_t) \) is the (optionally polynomial) feature map of the key.
+
+#### 2. Gradient Computation
+
+Taking the gradient with respect to \( S \):
+
+```
+∇_S ℓ_t(S) = (S φ_t − v_t) φ_t^T = S φ_t φ_t^T − v_t φ_t^T
+```
+
+Define:
+
+- **Prediction error (surprise)**: `δ_t = S_{t-1} φ_t − v_t`
+- **Gram term**: `G_t = φ_t φ_t^T`
+- **Cross term**: `B_t = v_t φ_t^T`
+
+#### 3. Titans-RNN (Online, e=1)
+
+**Without momentum:**
+
+```
+S_t = α_t S_{t-1} − η_t δ_t φ_t^T
+    = S_{t-1} (α_t I − η_t φ_t φ_t^T) + η_t v_t φ_t^T
+```
+
+**With momentum:**
+
+```
+Z_t = β_t Z_{t-1} + δ_t φ_t^T
+S_t = α_t S_{t-1} − η_t Z_t
+```
+
+**Retrieval:**
+
+```
+y_t = S_{t-1} ψ_t    (where ψ_t = φ(q_t))
+```
+
+#### 4. OmegaNet-RNN (Sliding Window, e ≥ 1)
+
+For context window \( W_t = \{t-e+1, ..., t\} \) with gates \( U_t^p \):
+
+```
+G_t = Σ_{p∈W_t} U_t^p φ_p φ_p^T    (Gram matrix)
+B_t = Σ_{p∈W_t} U_t^p v_p φ_p^T    (Cross term)
+Δ_t = S_{t-1} G_t − B_t            (Context surprise)
+```
+
+**Without momentum:**
+
+```
+S_t = S_{t-1} (α_t I − η_t G_t) + η_t B_t
+```
+
+**With momentum:**
+
+```
+Z_t = β_t Z_{t-1} + Δ_t
+S_t = α_t S_{t-1} − η_t Z_t
+```
+
+#### 5. Polynomial Feature Map
+
+```
+poly_mode = 'off':        φ(x) = x
+poly_mode = 'elementwise': φ(x) = Σ_{i=1}^{g} x^i
+poly_mode = 'tensor':      φ(x) = RandomProj([x, vec(x ⊗ x)])
+```
+
+### Parallelization via Affine Prefix Scan
+
+The naive RNN update has a sequential dependency on \( S\_{t-1} \), requiring \( O(T) \) sequential steps. Following the approach in the Atlas paper (Section 3.2), we reformulate the update as an **affine transformation** and use a **parallel prefix scan** (pure PyTorch implementation, no external dependencies) to compute all states in \( O(\log T) \) depth.
+
+#### Key Insight: Affine Form
+
+The RNN update can be rewritten as:
+
+```
+S_t = S_{t-1} @ A_t + C_t
+```
+
+where:
+
+- **A_t** = α_t I − η_t G_t (transition matrix)
+- **C_t** = η_t B_t (input term)
+- **G_t** = φ_t φ_t^T (Gram matrix)
+- **B_t** = v_t φ_t^T (cross term)
+
+This is an **affine recurrence**: each step applies a matrix multiplication plus an addition.
+
+#### With Momentum: Block Affine Form
+
+When using momentum, we have two coupled recurrences:
+
+```
+Z_t = β_t Z_{t-1} + g_t
+S_t = α_t S_{t-1} − η_t Z_t
+```
+
+We stack them into a joint state \( H_t = [S_t, Z_t] \) and build a block-affine system:
+
+```
+H_t = H_{t-1} @ A_t + C_t
+
+where A_t = ┌ α_t I − η_t G_t    G_t    ┐    C_t = [ η_t B_t,  −B_t ]
+            └ −η_t β_t I        β_t I   ┘
+```
+
+#### Associative Scan Algorithm
+
+Since affine transforms compose associatively:
+
+```
+(A₁, C₁) ∘ (A₂, C₂) = (A₁ @ A₂, C₁ @ A₂ + C₂)
+```
+
+We can use **parallel prefix scan** to compute all states simultaneously:
+
+```python
+def _affine_pair_operator(a, b):
+    """Compose affine transforms: H -> H @ A + C"""
+    A1, C1 = a
+    A2, C2 = b
+    return (A1 @ A2, C1 @ A2 + C2)
+
+def _affine_scan_apply(H0, A_seq, C_seq):
+    """
+    Compute H_t = H_{t-1} @ A_t + C_t for all t in O(log T) depth.
+
+    H0:    [B, M, D]       - initial state
+    A_seq: [B, T, D, D]    - per-token transition matrices
+    C_seq: [B, T, M, D]    - per-token input terms
+    Returns: H_all [B, T, M, D]
+    """
+    # Parallel prefix scan over (A, C) pairs
+    A_pref, C_pref = associative_scan(_affine_pair_operator, (A_seq, C_seq))
+    # Apply initial state: H_t = H_0 @ A_{1:t} + C_{1:t}
+    return torch.einsum('bmd,btde->btme', H0, A_pref) + C_pref
+```
+
+#### Implementation in Code
+
+From `rnn_memory.py`:
+
+```python
+# Build per-token affine transforms
+# G_t = φ_t ⊗ φ_t^T: [BH, T, d, d]
+G = torch.einsum('bti,btj->btij', phi_k, phi_k)
+# B_t = v_t ⊗ φ_t^T: [BH, T, d, d]
+B = torch.einsum('bti,btj->btij', v_bh, phi_k)
+
+if self.use_momentum:
+    # Block affine: H=[S,Z], H_t = H_{t-1} @ A_t + C_t
+    A11 = decay_e * I - lr_e * G   # S transition
+    A12 = G                         # Z -> S coupling
+    A21 = -(lr_e * mom_e) * I       # Cross term
+    A22 = mom_e * I                 # Z momentum
+
+    A_seq = block_diag(A11, A12, A21, A22)  # [BH, T, 2d, 2d]
+    C_seq = concat([lr_e * B, -B], dim=-1)  # [BH, T, d, 2d]
+
+    # Parallel scan: O(log T) depth instead of O(T)
+    H_all = _affine_scan_apply(H0, A_seq, C_seq)
+else:
+    # Simpler: A_t = α_t I - η_t G_t, C_t = η_t B_t
+    A_seq = decay_e * I - lr_e * G
+    C_seq = lr_e * B
+    S_all = _affine_scan_apply(S0, A_seq, C_seq)
+```
+
+#### Retrieval Uses Previous State
+
+Critical detail: retrieval at step \( t \) uses the **previous** state \( S\_{t-1} \):
+
+```python
+# S_start = [S_0, S_1, ..., S_{T-1}] (shifted by 1)
+S_start = torch.cat([S0.unsqueeze(1), S_all[:, :-1]], dim=1)
+# y_t = S_{t-1} @ ψ_t
+retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)
+```
+
+This ensures the model doesn't "see into the future" during training.
+
+### Comparison with Related Architectures
+
+| Model            | State  | Update             | Decay          | Context        |
+| ---------------- | ------ | ------------------ | -------------- | -------------- |
+| **Titans-RNN**   | Matrix | GD-derived         | α_t            | e=1 (online)   |
+| **OmegaNet-RNN** | Matrix | GD-derived         | α_t            | e≥1 (window)   |
+| **RWKV-7**       | Matrix | Designed           | w_t (data-dep) | Token-shift    |
+| **Mamba**        | Vector | SSM discretization | Ā_t            | Δ_t (data-dep) |
+
+## Installation
 
 ```bash
 pip install -e .
 pip install -e ".[examples]"
 ```
 
-Basic memory usage:
+## Usage
+
+### RNN Memory (Titans-RNN)
 
 ```python
 import torch
-from atlas_pytorch import NeuralMemory
+from atlas_pytorch import RNNMemory
 
-mem = NeuralMemory(
+mem = RNNMemory(
     dim = 384,
-    chunk_size = 64
+    heads = 8,
+    dim_head = 64,
+    use_momentum = True,
 ).cuda()
 
 seq = torch.randn(2, 1024, 384).cuda()
-retrieved, mem_state = mem(seq)
+retrieved, state = mem(seq)
 assert seq.shape == retrieved.shape
 ```
 
-MAC transformer (Memory-As-Context):
+### OmegaNet-RNN Memory
 
 ```python
 import torch
-from atlas_pytorch import MemoryAsContextTransformer
+from atlas_pytorch import OmegaRNNMemory
 
-transformer = MemoryAsContextTransformer(
-    num_tokens = 256,
-    dim = 256,
-    depth = 2,
-    segment_len = 128,
-    num_persist_mem_tokens = 4,
-    num_longterm_mem_tokens = 16,
-)
+mem = OmegaRNNMemory(
+    dim = 384,
+    heads = 8,
+    dim_head = 64,
+    omega_window = 4,        # context window size
+    use_omega_gate = True,   # learnable U gates
+    poly_degree = 2,         # polynomial features
+    poly_mode = 'elementwise',
+    use_momentum = True,
+).cuda()
 
-ids = torch.randint(0, 256, (1, 1023))
-loss = transformer(ids, return_loss = True)
-loss.backward()
-
-# after much training
-sampled = transformer.sample(ids[:, :4], 512)
+seq = torch.randn(2, 1024, 384).cuda()
+retrieved, state = mem(seq)
 ```
 
-MAG transformer (Memory-As-Gate) with Atlas:
+### MAG Transformer (Memory-As-Gate) with RNN Memory
 
 ```python
 import torch
 from atlas_pytorch import MemoryAsGateTransformer
 
-# MAG: sliding window attention + neural memory combined via gating
 transformer = MemoryAsGateTransformer(
     num_tokens = 256,
     dim = 256,
@@ -68,157 +275,129 @@ transformer = MemoryAsGateTransformer(
     window_size = 64,
     num_persist_mem_tokens = 4,
     neural_memory_layers = (1, 2, 3, 4),
-    # Atlas-specific options
-    omega_window = 2,           # context window for Omega rule
-    use_omega_gate = False,     # learned U gate
-    poly_degree = 2,            # polynomial features
+    # RNN memory options
+    use_rnn_memory = True,
+    omega_window = 2,
+    poly_degree = 2,
     poly_mode = 'elementwise',
-    use_muon_optimizer = False, # Muon for memory updates
 )
 
 ids = torch.randint(0, 256, (1, 512))
 loss = transformer(ids, return_loss = True)
 loss.backward()
-
-# sampling with cache
-sampled = transformer.sample(ids[:, :4], 256, use_cache = True)
 ```
 
-MAL transformer (Memory-As-Layer) with Atlas:
+### MAL Transformer (Memory-As-Layer)
 
 ```python
 import torch
 from atlas_pytorch import MemoryAsLayerTransformer
 
-# MAL: memory layer applied BEFORE attention
 transformer = MemoryAsLayerTransformer(
     num_tokens = 256,
     dim = 256,
     depth = 4,
     window_size = 64,
-    num_persist_mem_tokens = 4,
     neural_memory_layers = (1, 2, 3, 4),
-    # Atlas-specific options
+    use_rnn_memory = True,
     omega_window = 2,
-    use_omega_gate = False,
-    poly_degree = 2,
-    poly_mode = 'elementwise',
-    use_muon_optimizer = False,
 )
 
 ids = torch.randint(0, 256, (1, 512))
 loss = transformer(ids, return_loss = True)
 loss.backward()
-
-sampled = transformer.sample(ids[:, :4], 256, use_cache = True)
 ```
 
-AtlasLMM (Pure Atlas - Long-term Memory only):
+### LMM (Long-term Memory Model - Pure RNN)
 
 ```python
 import torch
-from atlas_pytorch import AtlasLMM
+from atlas_pytorch import LongTermMemoryModel
 
-# Pure memory model without attention
-model = AtlasLMM(
+model = LongTermMemoryModel(
     num_tokens = 256,
     dim = 256,
     depth = 4,
-    num_persist_mem_tokens = 4,
-    # Atlas-specific options
     omega_window = 2,
-    use_omega_gate = False,
     poly_degree = 2,
     poly_mode = 'elementwise',
-    use_muon_optimizer = False,
 )
 
 ids = torch.randint(0, 256, (1, 512))
 loss = model(ids, return_loss = True)
 loss.backward()
-
-sampled = model.sample(ids[:, :4], 256, use_cache = True)
 ```
 
-## Train (OmegaNet / Atlas)
+## Training
 
-This fork supports both OmegaNet (Omega rule with SGD) and Atlas (Omega + Muon) from the paper.
+### Unified Training Script
 
-### MAC architecture (Memory-As-Context)
+All architectures (MAG, MAL, MAC, LMM) with both Titans-RNN and OmegaNet-RNN:
 
 ```bash
-python train_mac.py --model omeganet --omega-window 2 --poly-mode elementwise --poly-degree 2
+# Titans-RNN MAG (omega_window=1, no gate)
+python train_rnn_transformer.py --arch mag --model titans --omega-window 1
+
+# OmegaNet-RNN MAL (omega_window>1, with gate)
+python train_rnn_transformer.py --arch mal --model omeganet --omega-window 4 --use-omega-gate
+
+# LMM (Pure RNN memory, no attention)
+python train_rnn_transformer.py --arch lmm --model omeganet --omega-window 2 --poly-degree 2
+
+# MAC (Memory-As-Context)
+python train_rnn_transformer.py --arch mac --model titans
 ```
 
-With Muon optimizer (Atlas):
+### Standalone RNN Memory Training
 
 ```bash
-python train_mac.py --model atlas --omega-window 2 --poly-mode elementwise --poly-degree 2
+python train_rnn_memory.py --omega-window 4 --use-momentum --poly-mode elementwise
 ```
-
-### MAG architecture (Memory-As-Gate)
-
-```bash
-python train_mag.py
-```
-
-Configure in script: `OMEGA_WINDOW`, `POLY_MODE`, `POLY_DEGREE`, `USE_MUON_OPTIMIZER`
-
-### MAL architecture (Memory-As-Layer)
-
-```bash
-python train_mal.py
-```
-
-### AtlasLMM (Pure Memory Model)
-
-```bash
-python train_atlas.py
-```
-
-### Optional flags (for train_mac.py)
-
-- `--use-omega-gate` to enable chunk-level U-gating
-- `--poly-mode {off,elementwise,tensor}`
-- `--poly-degree <int>`
-
-### Polynomial features (`poly-mode`)
-
-Atlas/OmegaNet can expand keys and queries with polynomial feature mappings to improve capacity and capture higher-order interactions:
-
-- `off`: disables polynomial lifting; uses raw linear projections.
-- `elementwise`: applies element-wise powers up to degree `g` and sums them, i.e. `x -> sum_{i=1..g} x^i`. This preserves the original dimensionality and is cheap (O(d)).
-- `tensor`: builds degree‑2 interaction features via the outer product `x ⊗ x`, concatenates `[x, vec(x⊗x)]`, then applies a fixed, non‑trainable random projection back to the original dimension. For practicality, higher degrees fall back to degree‑2 interactions.
-
-Why this design:
-
-- Capacity: Polynomial lifting increases the effective input dimension, improving the number of key–value associations a fixed-size memory can store (see paper’s capacity bounds).
-- Kernel view: Elementwise powers offer a Taylor‑like expansion that serves as a practical path towards richer kernels (e.g., approximating the exponential kernel behind softmax attention).
-- Efficiency: `elementwise` adds minimal overhead; `tensor` captures pairwise interactions while controlling dimensional blow‑up via a fixed projection.
-
-Implementation notes:
-
-- The mapping is applied to keys (always) and to queries via a wrapper, so storage and retrieval share the same lifted space.
-- The random projection in `tensor` mode is cached per device/dimension, non‑trainable, and keeps compute/memory bounded.
-- Recommended defaults:
-  - General: `--poly-mode elementwise --poly-degree 2`
-  - For stronger interactions (more compute): `--poly-mode tensor`
 
 ## Tests
 
 ```bash
-pytest -q tests/test_atlas.py
+# All tests
+pytest -q tests/test_rnn_all.py
+
+# Specific tests
+pytest -q tests/test_rnn_all.py -k "affine_scan"
 ```
+
+## Implementation Notes
+
+### Memory State Structure
+
+```python
+RNNMemState = namedtuple('RNNMemState', [
+    'seq_index',      # Current sequence position
+    'S',              # Memory state matrix [batch*heads, d, d]
+    'Z',              # Momentum state (if use_momentum=True)
+    'omega_buffer',   # Rolling buffer for Omega window (if omega_window>1)
+])
+```
+
+### Key Differences from Legacy (titans-pytorch, atlas-pytorch)
+
+| Aspect               | Legacy                        | atlas-rnn                          |
+| -------------------- | ----------------------------- | ---------------------------------- |
+| Gradient computation | `torch.func.grad`             | Explicit closed-form formula       |
+| Parallelization      | `assoc_scan` library (scalar) | Custom affine prefix scan (matrix) |
+| Triton dependency    | Required for GPU acceleration | None (pure PyTorch)                |
+| Memory type          | MLP parameters (W)            | State matrix (S)                   |
 
 ## Provenance / Attribution
 
-This repository originates from the excellent Titans implementation by lucidrains and was adapted to strictly follow the paper-aligned MAC (Memory-As-Context) semantics, then extended with OmegaNet and Atlas options:
+This repository derives from:
 
-- Original project: [lucidrains/titans-pytorch](https://github.com/lucidrains/titans-pytorch)
-- Paper-aligned MAC fixes (by Junyoung Park): committed-weights retrieval, segment-buffered inference queries, ephemeral context handling, and MAG/MAL/LMM architectural implementations aligned with Titans paper.
-- Atlas extension (by Junyoung Park): Omega rule with sliding window, polynomial feature mappings (`poly-mode`), Muon toggle for Atlas, CLI for switching between `titans`/`omeganet`/`atlas`, and a comprehensive test suite for Omega/Atlas behavior.
+1. **lucidrains/titans-pytorch**: Original Titans implementation
+2. **atlas-pytorch** (by Junyoung Park): Paper-aligned MAC fixes, MAG/MAL/LMM architectures, Atlas/OmegaNet extensions
+3. **RWKV-LM** (by BlinkDL): Training optimization techniques for RNN architectures
 
-This fork aims to provide a unified codebase for researching Titans and Atlas architectures with high fidelity to their respective papers.
+Key contributions in this fork:
+
+- Derivation of explicit RNN update rules from implicit GD formulation
+- Unified codebase for Titans-RNN and OmegaNet-RNN variants
 
 ## Citations
 
