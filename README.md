@@ -14,131 +14,180 @@ The Titans and Atlas papers show that linear attention can be viewed as implicit
 
 ### Mathematical Derivation
 
-#### 1. Internal Objective (Attentional Bias / Surprise)
+---
 
-For a memory state \( S \) and input key-value pair \( (k_t, v_t) \):
+#### Step 1: Linear Attention as Gradient Descent (Titans)
 
-```
-ℓ_t(S) = ½ ‖S φ_t − v_t‖²
-```
+The Titans paper establishes a fundamental equivalence: **linear attention is implicit gradient descent** on an associative memory objective.
 
-where \( φ_t = φ(k_t) \) is the (optionally polynomial) feature map of the key.
+Given a memory matrix $S$ and input key-value pair $(k_t, v_t)$, define the **surprise loss**:
 
-#### 2. Gradient Computation
+$$\mathcal{L}_t(S) = \frac{1}{2} \| S k_t - v_t \|^2$$
 
-Taking the gradient with respect to \( S \):
+This measures how well the memory $S$ can retrieve $v_t$ when queried with $k_t$.
 
-```
-∇_S ℓ_t(S) = (S φ_t − v_t) φ_t^T = S φ_t φ_t^T − v_t φ_t^T
-```
+**Gradient descent update:**
 
-Define:
+$$S_t = S_{t-1} - \eta_t \nabla_S \mathcal{L}_t(S_{t-1})$$
 
-- **Prediction error (surprise)**: `δ_t = S_{t-1} φ_t − v_t`
-- **Gram term**: `G_t = φ_t φ_t^T`
-- **Cross term**: `B_t = v_t φ_t^T`
+Computing the gradient:
 
-#### 3. Titans-RNN (Online, e=1)
+$$\nabla_S \mathcal{L}_t(S) = (S k_t - v_t) k_t^\top$$
 
-**Without momentum:**
+Substituting back:
 
-```
-S_t = α_t S_{t-1} − η_t δ_t φ_t^T
-    = S_{t-1} (α_t I − η_t φ_t φ_t^T) + η_t v_t φ_t^T
-```
+$$S_t = S_{t-1} - \eta_t (S_{t-1} k_t - v_t) k_t^\top$$
 
-**With momentum:**
+This is exactly the **delta rule** from associative memory literature. The term $(S_{t-1} k_t - v_t)$ is the **prediction error** (or "surprise").
 
-```
-Z_t = β_t Z_{t-1} + δ_t φ_t^T
-S_t = α_t S_{t-1} − η_t Z_t
-```
+---
 
-**Retrieval:**
+#### Step 2: Adding Weight Decay and Momentum (Titans)
 
-```
-y_t = S_{t-1} ψ_t    (where ψ_t = φ(q_t))
-```
+Titans extends the basic update with two regularization terms:
 
-#### 4. OmegaNet-RNN (Sliding Window, e ≥ 1)
+**Weight decay** ($\alpha_t$): Prevents unbounded memory growth
 
-For context window \( W_t = \{t-e+1, ..., t\} \) with gates \( U_t^p \):
+$$S_t = \alpha_t S_{t-1} - \eta_t \nabla_S \mathcal{L}_t$$
 
-```
-G_t = Σ_{p∈W_t} U_t^p φ_p φ_p^T    (Gram matrix)
-B_t = Σ_{p∈W_t} U_t^p v_p φ_p^T    (Cross term)
-Δ_t = S_{t-1} G_t − B_t            (Context surprise)
-```
+**Momentum** ($\beta_t$): Accelerates convergence by accumulating gradients
 
-**Without momentum:**
+$$Z_t = \beta_t Z_{t-1} + \nabla_S \mathcal{L}_t$$
+$$S_t = \alpha_t S_{t-1} - \eta_t Z_t$$
 
-```
-S_t = S_{t-1} (α_t I − η_t G_t) + η_t B_t
-```
+where $Z_t$ is the momentum buffer.
+
+**Expanding the gradient**, we get the full **Titans-RNN update**:
+
+$$\boxed{S_t = \alpha_t S_{t-1} - \eta_t \left( S_{t-1} k_t k_t^\top - v_t k_t^\top \right)}$$
+
+Or equivalently:
+
+$$S_t = S_{t-1} \left( \alpha_t I - \eta_t k_t k_t^\top \right) + \eta_t v_t k_t^\top$$
 
 **With momentum:**
 
-```
-Z_t = β_t Z_{t-1} + Δ_t
-S_t = α_t S_{t-1} − η_t Z_t
-```
+$$Z_t = \beta_t Z_{t-1} + \left( S_{t-1} k_t - v_t \right) k_t^\top$$
+$$S_t = \alpha_t S_{t-1} - \eta_t Z_t$$
 
-#### 5. Polynomial Feature Map
+**Retrieval** (using query $q_t$):
 
-```
-poly_mode = 'off':        φ(x) = x
-poly_mode = 'elementwise': φ(x) = Σ_{i=1}^{g} x^i
-poly_mode = 'tensor':      φ(x) = RandomProj([x, vec(x ⊗ x)])
-```
+$$y_t = S_{t-1} \, q_t$$
 
-### Parallelization via Affine Prefix Scan
+Note: We use the **previous** state $S_{t-1}$ for retrieval to maintain causality.
 
-The naive RNN update has a sequential dependency on \( S\_{t-1} \), requiring \( O(T) \) sequential steps. Following the approach in the Atlas paper (Section 3.2), we reformulate the update as an **affine transformation** and use a **parallel prefix scan** (pure PyTorch implementation, no external dependencies) to compute all states in \( O(\log T) \) depth.
+---
 
-#### Key Insight: Affine Form
+#### Step 3: Polynomial Feature Maps (Atlas)
 
-The RNN update can be rewritten as:
+Atlas introduces **polynomial feature maps** to increase memory capacity. Instead of raw keys, we use:
 
-```
-S_t = S_{t-1} @ A_t + C_t
-```
+$$\phi(k) = \text{FeatureMap}(k)$$
+
+Three modes are supported:
+
+| Mode          | Feature Map $\phi(x)$                                                 |
+| ------------- | --------------------------------------------------------------------- |
+| `off`         | $\phi(x) = x$                                                         |
+| `elementwise` | $\phi(x) = \sum_{i=1}^{g} x^{\circ i}$ (element-wise powers)          |
+| `tensor`      | $\phi(x) = \text{Proj}\left( [x; \, \text{vec}(x \otimes x)] \right)$ |
+
+The update rules remain the same, but with $\phi(k_t)$ replacing $k_t$:
+
+$$S_t = \alpha_t S_{t-1} - \eta_t \left( S_{t-1} \phi_t \phi_t^\top - v_t \phi_t^\top \right)$$
+
+where $\phi_t = \phi(k_t)$.
+
+---
+
+#### Step 4: Sliding Window Update — The Omega Rule (Atlas)
+
+The key innovation in Atlas is the **Omega rule**: instead of updating based on a single token, aggregate gradients over a sliding window of size $e$.
+
+For window $W_t = \{t-e+1, \ldots, t\}$ with learnable gates $U_t^{(p)}$:
+
+**Aggregated loss:**
+
+$$\mathcal{L}_t^{\Omega}(S) = \sum_{p \in W_t} U_t^{(p)} \cdot \frac{1}{2} \| S \phi_p - v_p \|^2$$
+
+**Aggregated gradient:**
+
+$$\nabla_S \mathcal{L}_t^{\Omega} = \sum_{p \in W_t} U_t^{(p)} \left( S \phi_p - v_p \right) \phi_p^\top$$
+
+$$= S \underbrace{\left( \sum_{p \in W_t} U_t^{(p)} \phi_p \phi_p^\top \right)}_{G_t} - \underbrace{\sum_{p \in W_t} U_t^{(p)} v_p \phi_p^\top}_{B_t}$$
 
 where:
 
-- **A_t** = α_t I − η_t G_t (transition matrix)
-- **C_t** = η_t B_t (input term)
-- **G_t** = φ_t φ_t^T (Gram matrix)
-- **B_t** = v_t φ_t^T (cross term)
+- $G_t = \sum_{p \in W_t} U_t^{(p)} \phi_p \phi_p^\top$ — weighted outer product sum
+- $B_t = \sum_{p \in W_t} U_t^{(p)} v_p \phi_p^\top$ — weighted target-key product sum
 
-This is an **affine recurrence**: each step applies a matrix multiplication plus an addition.
+**OmegaNet-RNN update (without momentum):**
+
+$$\boxed{S_t = S_{t-1} \left( \alpha_t I - \eta_t G_t \right) + \eta_t B_t}$$
+
+**With momentum:**
+
+$$Z_t = \beta_t Z_{t-1} + \left( S_{t-1} G_t - B_t \right)$$
+$$S_t = \alpha_t S_{t-1} - \eta_t Z_t$$
+
+---
+
+#### Summary: Unified RNN Form
+
+| Variant          | Window     | Update Rule                                                          |
+| ---------------- | ---------- | -------------------------------------------------------------------- |
+| **Titans-RNN**   | $e=1$      | $S_t = \alpha_t S_{t-1} - \eta_t (S_{t-1} \phi_t - v_t) \phi_t^\top$ |
+| **OmegaNet-RNN** | $e \geq 1$ | $S_t = \alpha_t S_{t-1} - \eta_t (S_{t-1} G_t - B_t)$                |
+
+Both are **explicit RNN updates** derived from implicit gradient descent, enabling efficient parallel computation without `torch.func`.
+
+---
+
+## Parallelization via Affine Prefix Scan
+
+The naive RNN update has a sequential dependency on $S_{t-1}$, requiring $O(T)$ sequential steps. Following the approach in the Atlas paper (Section 3.2), we reformulate the update as an **affine transformation** and use a **parallel prefix scan** (pure PyTorch implementation, no external dependencies) to compute all states in $O(\log T)$ depth.
+
+---
+
+#### Key Insight: Affine Form
+
+The RNN update can be rewritten as an affine recurrence:
+
+$$S_t = S_{t-1} A_t + C_t$$
+
+where:
+
+- $A_t = \alpha_t I - \eta_t \phi_t \phi_t^\top$ — transition matrix
+- $C_t = \eta_t v_t \phi_t^\top$ — input term
+
+Each step applies a **matrix multiplication** plus an **addition**.
+
+---
 
 #### With Momentum: Block Affine Form
 
 When using momentum, we have two coupled recurrences:
 
-```
-Z_t = β_t Z_{t-1} + g_t
-S_t = α_t S_{t-1} − η_t Z_t
-```
+$$Z_t = \beta_t Z_{t-1} + g_t$$
+$$S_t = \alpha_t S_{t-1} - \eta_t Z_t$$
 
-We stack them into a joint state \( H_t = [S_t, Z_t] \) and build a block-affine system:
+We stack them into a joint state $H_t = [S_t; Z_t]$ and build a **block-affine system**:
 
-```
-H_t = H_{t-1} @ A_t + C_t
+$$H_t = H_{t-1} A_t + C_t$$
 
-where A_t = ┌ α_t I − η_t G_t    G_t    ┐    C_t = [ η_t B_t,  −B_t ]
-            └ −η_t β_t I        β_t I   ┘
-```
+where:
+
+$$A_t = \begin{bmatrix} \alpha_t I - \eta_t G_t & G_t \\ -\eta_t \beta_t I & \beta_t I \end{bmatrix}, \quad C_t = \begin{bmatrix} \eta_t B_t & -B_t \end{bmatrix}$$
+
+---
 
 #### Associative Scan Algorithm
 
-Since affine transforms compose associatively:
+Since affine transforms compose **associatively**:
 
-```
-(A₁, C₁) ∘ (A₂, C₂) = (A₁ @ A₂, C₁ @ A₂ + C₂)
-```
+$$(A_1, C_1) \circ (A_2, C_2) = (A_1 A_2, \; C_1 A_2 + C_2)$$
 
-We can use **parallel prefix scan** to compute all states simultaneously:
+We can use **parallel prefix scan** to compute all states simultaneously in $O(\log T)$ parallel steps:
 
 ```python
 def _affine_pair_operator(a, b):
@@ -194,7 +243,11 @@ else:
 
 #### Retrieval Uses Previous State
 
-Critical detail: retrieval at step \( t \) uses the **previous** state \( S\_{t-1} \):
+Critical detail: retrieval at step $t$ uses the **previous** state $S_{t-1}$:
+
+$$y_t = S_{t-1} \, \psi_t \quad \text{where } \psi_t = \phi(q_t)$$
+
+In code:
 
 ```python
 # S_start = [S_0, S_1, ..., S_{T-1}] (shifted by 1)
@@ -205,14 +258,16 @@ retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)
 
 This ensures the model doesn't "see into the future" during training.
 
+---
+
 ### Comparison with Related Architectures
 
-| Model            | State  | Update             | Decay          | Context        |
-| ---------------- | ------ | ------------------ | -------------- | -------------- |
-| **Titans-RNN**   | Matrix | GD-derived         | α_t            | e=1 (online)   |
-| **OmegaNet-RNN** | Matrix | GD-derived         | α_t            | e≥1 (window)   |
-| **RWKV-7**       | Matrix | Designed           | w_t (data-dep) | Token-shift    |
-| **Mamba**        | Vector | SSM discretization | Ā_t            | Δ_t (data-dep) |
+| Model            | State  | Update             | Decay            | Context               |
+| ---------------- | ------ | ------------------ | ---------------- | --------------------- |
+| **Titans-RNN**   | Matrix | GD-derived         | $\alpha_t$       | $e=1$ (online)        |
+| **OmegaNet-RNN** | Matrix | GD-derived         | $\alpha_t$       | $e \geq 1$ (window)   |
+| **RWKV-7**       | Matrix | Designed           | $w_t$ (data-dep) | Token-shift           |
+| **Mamba**        | Vector | SSM discretization | $\bar{A}_t$      | $\Delta_t$ (data-dep) |
 
 ## Installation
 
