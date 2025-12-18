@@ -143,102 +143,106 @@ Both are **explicit RNN updates** derived from implicit gradient descent, enabli
 
 ---
 
-## Parallelization via Affine Prefix Scan
+## Parallelization via Efficient Scalar Scan
 
-The naive RNN update has a sequential dependency on $S_{t-1}$, requiring $O(T)$ sequential steps. Following the approach in the Atlas paper (Section 3.2), we reformulate the update as an **affine transformation** and use a **parallel prefix scan** (pure PyTorch implementation, no external dependencies) to compute all states in $O(\log T)$ depth.
-
----
-
-#### Key Insight: Affine Form
-
-The RNN update can be rewritten as an affine recurrence:
-
-$$S_t = S_{t-1} A_t + C_t$$
-
-where:
-
-- $A_t = \alpha_t I - \eta_t \phi_t \phi_t^\top$ — transition matrix
-- $C_t = \eta_t v_t \phi_t^\top$ — input term
-
-Each step applies a **matrix multiplication** plus an **addition**.
+The naive RNN update has a sequential dependency on $S_{t-1}$, requiring $O(T)$ sequential steps. We use an **efficient scalar scan** approach inspired by the Atlas paper, achieving $O(\log T)$ parallel depth with memory-efficient implementation.
 
 ---
 
-#### With Momentum: Block Affine Form
+#### Key Insight: Delta Decomposition
 
-When using momentum, we have two coupled recurrences:
+The Atlas paper computes gradients using a **fixed reference state** $S_0$ (chunk-start state):
 
-$$Z_t = \beta_t Z_{t-1} + g_t$$
-$$S_t = \alpha_t S_{t-1} - \eta_t Z_t$$
+$$\delta_t = -\eta_t \left( S_0 G_t - B_t \right)$$
 
-We stack them into a joint state $H_t = [S_t; Z_t]$ and build a **block-affine system**:
-
-$$H_t = H_{t-1} A_t + C_t$$
-
-where:
-
-$$A_t = \begin{bmatrix} \alpha_t I - \eta_t G_t & G_t \\ -\eta_t \beta_t I & \beta_t I \end{bmatrix}, \quad C_t = \begin{bmatrix} \eta_t B_t & -B_t \end{bmatrix}$$
+This decouples the gradient computation from the state sequence, allowing **fully parallel** computation of all $\delta_t$.
 
 ---
 
-#### Associative Scan Algorithm
+#### Memory Update as Scalar-Gated Recurrence
 
-Since affine transforms compose **associatively**:
+With the delta terms pre-computed, the state update becomes a simple **scalar-gated** recurrence:
 
-$$(A_1, C_1) \circ (A_2, C_2) = (A_1 A_2, \; C_1 A_2 + C_2)$$
+$$S_t = \alpha_t S_{t-1} + \delta_t$$
 
-We can use **parallel prefix scan** to compute all states simultaneously in $O(\log T)$ parallel steps:
+where $\alpha_t$ is a **scalar** decay factor. This enables efficient parallel scan with minimal memory overhead.
+
+---
+
+#### With Momentum
+
+When using momentum, we have:
+
+$$Z_t = \beta_t Z_{t-1} + g_t \quad \text{where } g_t = S_0 G_t - B_t$$
+$$\delta_t = -\eta_t Z_t$$
+$$S_t = \alpha_t S_{t-1} + \delta_t$$
+
+The momentum buffer $Z_t$ is also updated via scalar scan.
+
+---
+
+#### Algorithm (Memory-Efficient)
 
 ```python
-def _affine_pair_operator(a, b):
-    """Compose affine transforms: H -> H @ A + C"""
-    A1, C1 = a
-    A2, C2 = b
-    return (A1 @ A2, C1 @ A2 + C2)
+def efficient_forward(x, S0, Z0):
+    # Step 1: Compute per-token outer products (parallel)
+    G = einsum('bti,btj->btij', phi_k, phi_k)  # [BH, T, d, d]
+    B = einsum('bti,btj->btij', v_bh, phi_k)    # [BH, T, d, d]
 
-def _affine_scan_apply(H0, A_seq, C_seq):
-    """
-    Compute H_t = H_{t-1} @ A_t + C_t for all t in O(log T) depth.
+    # Step 2: Apply Omega sliding window if needed (parallel)
+    G_windowed = sliding_sum(G, window=omega_window)
+    B_windowed = sliding_sum(B, window=omega_window)
 
-    H0:    [B, M, D]       - initial state
-    A_seq: [B, T, D, D]    - per-token transition matrices
-    C_seq: [B, T, M, D]    - per-token input terms
-    Returns: H_all [B, T, M, D]
-    """
-    # Parallel prefix scan over (A, C) pairs
-    A_pref, C_pref = associative_scan(_affine_pair_operator, (A_seq, C_seq))
-    # Apply initial state: H_t = H_0 @ A_{1:t} + C_{1:t}
-    return torch.einsum('bmd,btde->btme', H0, A_pref) + C_pref
+    # Step 3: Compute gradients using FIXED S0 (parallel, one batch matmul)
+    # g_t = S_0 @ G_t - B_t
+    g_all = einsum('bde,btef->btdf', S0, G_windowed) - B_windowed
+
+    # Step 4: Momentum update via scalar scan
+    Z_all = scalar_scan(beta, g_all, Z0)  # Z_t = β_t * Z_{t-1} + g_t
+
+    # Step 5: Compute delta terms
+    delta = -lr * Z_all  # [BH, T, d, d]
+
+    # Step 6: State update via scalar scan
+    S_all = scalar_scan(alpha, delta, S0)  # S_t = α_t * S_{t-1} + δ_t
+
+    return S_all
 ```
+
+---
+
+#### Why This Works (Mathematical Justification)
+
+This is the **exact same algorithm** used in the original Titans paper (Section 3.2):
+
+1. **Per-sample gradient**: Gradients are computed w.r.t. a fixed "chunk-start" state $S_0$
+2. **Parallel computation**: All $\delta_t$ terms can be computed independently
+3. **State accumulation**: Final states computed via efficient scalar scan
+
+---
 
 #### Implementation in Code
 
 From `rnn_memory.py`:
 
 ```python
-# Build per-token affine transforms
-# G_t = φ_t ⊗ φ_t^T: [BH, T, d, d]
+# Compute outer products
 G = torch.einsum('bti,btj->btij', phi_k, phi_k)
-# B_t = v_t ⊗ φ_t^T: [BH, T, d, d]
 B = torch.einsum('bti,btj->btij', v_bh, phi_k)
 
-if self.use_momentum:
-    # Block affine: H=[S,Z], H_t = H_{t-1} @ A_t + C_t
-    A11 = decay_e * I - lr_e * G   # S transition
-    A12 = G                         # Z -> S coupling
-    A21 = -(lr_e * mom_e) * I       # Cross term
-    A22 = mom_e * I                 # Z momentum
+# Apply omega window (sliding sum)
+G_w = _sliding_sum_along_time(G, omega_window)
+B_w = _sliding_sum_along_time(B, omega_window)
 
-    A_seq = block_diag(A11, A12, A21, A22)  # [BH, T, 2d, 2d]
-    C_seq = concat([lr_e * B, -B], dim=-1)  # [BH, T, d, 2d]
+# Gradient using fixed S0 (one batch matmul!)
+g = torch.einsum('bde,btef->btdf', S0, G_w) - B_w
 
-    # Parallel scan: O(log T) depth instead of O(T)
-    H_all = _affine_scan_apply(H0, A_seq, C_seq)
-else:
-    # Simpler: A_t = α_t I - η_t G_t, C_t = η_t B_t
-    A_seq = decay_e * I - lr_e * G
-    C_seq = lr_e * B
-    S_all = _affine_scan_apply(S0, A_seq, C_seq)
+# Momentum via scalar scan
+Z_all = _scalar_scan(momentum, g, Z0)
+
+# Delta and state via scalar scan
+delta = -lr_e * Z_all
+S_all = _scalar_scan(decay, delta, S0)
 ```
 
 #### Retrieval Uses Previous State
@@ -416,7 +420,7 @@ python train_rnn_memory.py --omega-window 4 --use-momentum --poly-mode elementwi
 pytest -q tests/test_rnn_all.py
 
 # Specific tests
-pytest -q tests/test_rnn_all.py -k "affine_scan"
+pytest -q tests/test_rnn_all.py -k "assoc_scan"
 ```
 
 ## Implementation Notes
@@ -434,12 +438,10 @@ RNNMemState = namedtuple('RNNMemState', [
 
 ### Key Differences from Legacy (titans-pytorch, atlas-pytorch)
 
-| Aspect               | Legacy                        | atlas-rnn                          |
-| -------------------- | ----------------------------- | ---------------------------------- |
-| Gradient computation | `torch.func.grad`             | Explicit closed-form formula       |
-| Parallelization      | `assoc_scan` library (scalar) | Custom affine prefix scan (matrix) |
-| Triton dependency    | Required for GPU acceleration | None (pure PyTorch)                |
-| Memory type          | MLP parameters (W)            | State matrix (S)                   |
+| Aspect               | Legacy             | atlas-rnn                    |
+| -------------------- | ------------------ | ---------------------------- |
+| Gradient computation | `torch.func.grad`  | Explicit closed-form formula |
+| Memory type          | MLP parameters (W) | State matrix (S)             |
 
 ## Provenance / Attribution
 

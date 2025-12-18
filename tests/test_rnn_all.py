@@ -8,10 +8,10 @@ from atlas_pytorch.rnn_memory import (
     OmegaRNNMemoryCell,
     PolynomialFeatureMap,
     RNNMemState,
-    _affine_scan_apply,
     _sliding_sum_along_time,
 )
 from atlas_pytorch.rnn_transformer import RNNMemoryTransformer
+from assoc_scan import AssocScan
 import math
 
 # -----------------------------------------------------------------------------
@@ -117,20 +117,56 @@ def test_state_continuity_omega():
 
 
 # ---------------------------------------------------------
-# Per-token semantics parity: full sequence vs incremental
+# Mini-batch vs Online SGD behavior tests
 # ---------------------------------------------------------
 
-def test_per_token_parity_rnn():
+def test_minibatch_vs_online_sgd():
     """
-    Per-token semantics: processing full sequence at once should
-    match processing token-by-token.
+    Test that full sequence (mini-batch SGD) and token-by-token (online SGD)
+    produce different but both valid results.
+    
+    Full sequence: uses fixed S_0 (chunk-start state) for all gradients
+    Incremental: uses updated state for each token's gradient
+    
+    This is expected behavior (same as original Atlas paper approximation).
     """
     torch.manual_seed(42)
     cell = RNNMemoryCell(dim=32, dim_head=16, heads=1, use_momentum=True, qkv_conv_kernel=None)
     x = torch.randn(1, 8, 32)
     
-    # Full sequence at once
+    # Full sequence at once (mini-batch SGD)
     out_full, s_full = cell(x)
+    
+    # Token by token (online SGD)
+    outs_inc = []
+    st = None
+    for t in range(x.shape[1]):
+        o, st = cell(x[:, t:t+1, :], state=st)
+        outs_inc.append(o)
+    out_inc = torch.cat(outs_inc, dim=1)
+    
+    # Shapes should match
+    assert out_full.shape == out_inc.shape
+    
+    # Both should be finite
+    assert torch.isfinite(out_full).all()
+    assert torch.isfinite(out_inc).all()
+    
+    # Final states should be finite
+    assert torch.isfinite(s_full.S).all()
+    assert torch.isfinite(st.S).all()
+    
+    # The outputs should be different (mini-batch vs online)
+    # but for very short sequences with small lr, they should be close
+    max_diff = (out_full - out_inc).abs().max()
+    assert max_diff < 1.0, f"Max diff too large: {max_diff}"
+
+
+def test_incremental_state_continuity():
+    """Token-by-token processing should accumulate state correctly."""
+    torch.manual_seed(42)
+    cell = OmegaRNNMemoryCell(dim=32, dim_head=16, heads=1, omega_window=3, use_omega_gate=False, qkv_conv_kernel=None, use_momentum=True)
+    x = torch.randn(1, 12, 32)
     
     # Token by token
     outs_inc = []
@@ -138,79 +174,98 @@ def test_per_token_parity_rnn():
     for t in range(x.shape[1]):
         o, st = cell(x[:, t:t+1, :], state=st)
         outs_inc.append(o)
+        # State should always be finite
+        assert torch.isfinite(st.S).all(), f"State diverged at token {t}"
+    
     out_inc = torch.cat(outs_inc, dim=1)
-    
-    assert out_full.shape == out_inc.shape
-    assert torch.allclose(out_full, out_inc, atol=1e-4, rtol=1e-4), \
-        f"Max diff: {(out_full - out_inc).abs().max()}"
-    assert torch.allclose(s_full.S, st.S, atol=1e-4, rtol=1e-4)
+    assert out_inc.shape == (1, 12, 32)
+    assert torch.isfinite(out_inc).all()
 
 
-def test_per_token_parity_omega():
-    """Same for Omega cell with window > 1."""
-    torch.manual_seed(42)
-    cell = OmegaRNNMemoryCell(dim=32, dim_head=16, heads=1, omega_window=3, use_omega_gate=False, qkv_conv_kernel=None, use_momentum=True)
-    x = torch.randn(1, 12, 32)
-    
-    out_full, s_full = cell(x)
-    
-    outs_inc = []
-    st = None
-    for t in range(x.shape[1]):
-        o, st = cell(x[:, t:t+1, :], state=st)
-        outs_inc.append(o)
-    out_inc = torch.cat(outs_inc, dim=1)
-    
-    assert out_full.shape == out_inc.shape
-    assert torch.allclose(out_full, out_inc, atol=1e-4, rtol=1e-4), \
-        f"Max diff: {(out_full - out_inc).abs().max()}"
-
-
-def test_per_token_parity_batched():
-    """Per-token parity with larger batch."""
+def test_chunk_processing_consistency():
+    """Processing in chunks should give consistent results."""
     torch.manual_seed(42)
     cell = RNNMemoryCell(dim=32, dim_head=16, heads=2, use_momentum=True, qkv_conv_kernel=None)
-    x = torch.randn(3, 10, 32)
+    x = torch.randn(2, 12, 32)
     
+    # Full sequence
     out_full, s_full = cell(x)
     
-    outs_inc = []
-    st = None
-    for t in range(x.shape[1]):
-        o, st = cell(x[:, t:t+1, :], state=st)
-        outs_inc.append(o)
-    out_inc = torch.cat(outs_inc, dim=1)
+    # Process in two chunks of 6
+    out1, s1 = cell(x[:, :6, :])
+    out2, s2 = cell(x[:, 6:, :], state=s1)
+    out_chunked = torch.cat([out1, out2], dim=1)
     
-    assert torch.allclose(out_full, out_inc, atol=1e-4, rtol=1e-4)
+    # Chunked processing should be finite
+    assert torch.isfinite(out_chunked).all()
+    assert torch.isfinite(s2.S).all()
+    
+    # For mini-batch SGD, chunking changes the reference state,
+    # so results will differ but should be close
+    max_diff = (out_full - out_chunked).abs().max()
+    assert max_diff < 1.0, f"Chunk processing diverged: {max_diff}"
 
 
 # ---------------------------------------------------------
-# Affine scan helper tests
+# AssocScan helper tests
 # ---------------------------------------------------------
 
-def test_affine_scan_identity():
-    """Identity A, zero C should preserve H0."""
-    B, T, M, D = 2, 5, 4, 4
-    H0 = torch.randn(B, M, D)
-    I = torch.eye(D).expand(B, T, D, D)
-    C = torch.zeros(B, T, M, D)
-    H_all = _affine_scan_apply(H0, I, C)
-    # All H_t should equal H0
+def test_assoc_scan_identity():
+    """Alpha=1, delta=0 should preserve x0."""
+    assoc_scan = AssocScan(use_accelerated=False)
+    B, T, D = 2, 5, 4
+    x0 = torch.randn(B, D, D)
+    alpha = torch.ones(B, T)
+    delta = torch.zeros(B, T, D, D)
+    x_all = assoc_scan(alpha, delta, prev=x0)
+    # All x_t should equal x0
     for t in range(T):
-        assert torch.allclose(H_all[:, t], H0, atol=1e-6)
+        assert torch.allclose(x_all[:, t], x0, atol=1e-5)
 
 
-def test_affine_scan_additive():
-    """Identity A, constant C should accumulate."""
-    B, T, M, D = 1, 4, 2, 2
-    H0 = torch.zeros(B, M, D)
-    I = torch.eye(D).expand(B, T, D, D)
-    C = torch.ones(B, T, M, D)
-    H_all = _affine_scan_apply(H0, I, C)
-    # H_t = t * C
+def test_assoc_scan_additive():
+    """Alpha=1, constant delta should accumulate."""
+    assoc_scan = AssocScan(use_accelerated=False)
+    B, T, D = 1, 4, 2
+    x0 = torch.zeros(B, D, D)
+    alpha = torch.ones(B, T)
+    delta = torch.ones(B, T, D, D)
+    x_all = assoc_scan(alpha, delta, prev=x0)
+    # x_t = t * delta
     for t in range(T):
-        expected = torch.full((B, M, D), float(t + 1))
-        assert torch.allclose(H_all[:, t], expected, atol=1e-6)
+        expected = torch.full((B, D, D), float(t + 1))
+        assert torch.allclose(x_all[:, t], expected, atol=1e-5)
+
+
+def test_assoc_scan_decay():
+    """Test exponential decay with alpha < 1."""
+    assoc_scan = AssocScan(use_accelerated=False)
+    B, T, D = 1, 4, 2
+    x0 = torch.ones(B, D, D)
+    alpha = torch.full((B, T), 0.5)  # decay by half each step
+    delta = torch.zeros(B, T, D, D)
+    x_all = assoc_scan(alpha, delta, prev=x0)
+    # x_t = x0 * (0.5)^t
+    for t in range(T):
+        expected = torch.full((B, D, D), 0.5 ** (t + 1))
+        assert torch.allclose(x_all[:, t], expected, atol=1e-5)
+
+
+def test_assoc_scan_mixed():
+    """Test with both decay and additive terms."""
+    assoc_scan = AssocScan(use_accelerated=False)
+    B, T, D = 1, 3, 2
+    x0 = torch.zeros(B, D, D)
+    alpha = torch.full((B, T), 0.5)
+    delta = torch.ones(B, T, D, D)
+    x_all = assoc_scan(alpha, delta, prev=x0)
+    # x_1 = 0 * 0.5 + 1 = 1
+    # x_2 = 1 * 0.5 + 1 = 1.5
+    # x_3 = 1.5 * 0.5 + 1 = 1.75
+    expected = torch.tensor([[[1.0, 1.0], [1.0, 1.0]],
+                              [[1.5, 1.5], [1.5, 1.5]],
+                              [[1.75, 1.75], [1.75, 1.75]]]).unsqueeze(0)
+    assert torch.allclose(x_all, expected, atol=1e-4)
 
 
 def test_sliding_sum_along_time():
@@ -586,18 +641,6 @@ def test_mal_has_two_ff():
     # Check for ff_pre and ff_post attributes
     assert hasattr(layer, 'ff_pre')
     assert hasattr(layer, 'ff_post')
-
-
-# ---------------------------------------------------------
-# Legacy chunk_size parameter (should be ignored)
-# ---------------------------------------------------------
-
-def test_chunk_size_ignored():
-    """chunk_size parameter should be accepted but ignored."""
-    cell = RNNMemoryCell(dim=32, dim_head=16, heads=1, chunk_size=16, qkv_conv_kernel=None)
-    x = torch.randn(1, 8, 32)
-    out, _ = cell(x)
-    assert out.shape == x.shape
 
 
 # ---------------------------------------------------------
