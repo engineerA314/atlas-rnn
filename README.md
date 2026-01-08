@@ -1,8 +1,10 @@
-<img src="./fig1.png" width="400px"></img>
+# Atlas-RNN (PyTorch)
 
-<img src="./fig2.png" width="400px"></img>
+<img alt="Figure 1" src="./fig1.png" width="400px"></img>
 
-## Atlas-RNN - Pytorch
+<img alt="Figure 2" src="./fig2.png" width="400px"></img>
+
+## Atlas-RNN - PyTorch
 
 **Pure RNN-form implementation of Titans and Atlas (OmegaNet) memory architectures.**
 
@@ -149,7 +151,7 @@ The naive RNN update has a sequential dependency on $S_{t-1}$, requiring $O(T)$ 
 
 ---
 
-#### Key Insight: Delta Decomposition
+### Key Insight: Delta Decomposition
 
 The Atlas paper computes gradients using a **fixed reference state** $S_0$ (chunk-start state):
 
@@ -159,7 +161,7 @@ This decouples the gradient computation from the state sequence, allowing **full
 
 ---
 
-#### Memory Update as Scalar-Gated Recurrence
+### Memory Update as Scalar-Gated Recurrence
 
 With the delta terms pre-computed, the state update becomes a simple **scalar-gated** recurrence:
 
@@ -169,7 +171,7 @@ where $\alpha_t$ is a **scalar** decay factor. This enables efficient parallel s
 
 ---
 
-#### With Momentum
+### With Momentum
 
 When using momentum, we have:
 
@@ -181,37 +183,44 @@ The momentum buffer $Z_t$ is also updated via scalar scan.
 
 ---
 
-#### Algorithm (Memory-Efficient)
+### Algorithm (Memory-Efficient)
 
 ```python
-def efficient_forward(x, S0, Z0):
-    # Step 1: Compute per-token outer products (parallel)
-    G = einsum('bti,btj->btij', phi_k, phi_k)  # [BH, T, d, d]
-    B = einsum('bti,btj->btij', v_bh, phi_k)    # [BH, T, d, d]
+def efficient_forward(phi_k, v_bh, S_ref, S0, Z0, alpha, beta, lr, omega_gate=None, omega_window=1, prev_g=None):
 
-    # Step 2: Apply Omega sliding window if needed (parallel)
-    G_windowed = sliding_sum(G, window=omega_window)
-    B_windowed = sliding_sum(B, window=omega_window)
+    BH, T, d = phi_k.shape
 
-    # Step 3: Compute gradients using FIXED S0 (parallel, one batch matmul)
-    # g_t = S_0 @ G_t - B_t
-    g_all = einsum('bde,btef->btdf', S0, G_windowed) - B_windowed
+    # Step 1: Prediction error vector
+    # δ_t = S_ref @ φ_t - v_t
+    pred = torch.einsum('bde,bte->btd', S_ref, phi_k)    # [BH, T, d]
+    delta_vec = pred - v_bh                               # [BH, T, d]
 
-    # Step 4: Momentum update via scalar scan
-    Z_all = scalar_scan(beta, g_all, Z0)  # Z_t = β_t * Z_{t-1} + g_t
+    # Step 2: Per-token gradient (rank-1, before omega window)
+    # g_raw_t = δ_t ⊗ φ_t^T
+    g_raw = torch.einsum('bti,btj->btij', delta_vec, phi_k)  # [BH, T, d, d]
+    if omega_gate is not None:
+        g_raw = g_raw * omega_gate[..., None, None]
 
-    # Step 5: Compute delta terms
-    delta = -lr * Z_all  # [BH, T, d, d]
+    # Step 3: Omega window on g (single sliding-sum buffer)
+    if omega_window > 1:
+        if prev_g is None:
+            prev_g = g_raw.new_zeros((BH, omega_window - 1, d, d))
+        g_ext = torch.cat([prev_g, g_raw], dim=1)               # [BH, (e-1)+T, d, d]
+        g = sliding_sum(g_ext, window=omega_window)[:, -T:]     # [BH, T, d, d]
+    else:
+        g = g_raw
 
-    # Step 6: State update via scalar scan
-    S_all = scalar_scan(alpha, delta, S0)  # S_t = α_t * S_{t-1} + δ_t
+    # Step 4: Momentum + state via scalar scan
+    Z_all = scalar_scan(beta, g, Z0)                            # [BH, T, d, d]
+    delta = -lr[..., None, None] * Z_all                        # [BH, T, d, d]
+    S_all = scalar_scan(alpha, delta, S0)                       # [BH, T, d, d]
 
     return S_all
 ```
 
 ---
 
-#### Why This Works (Mathematical Justification)
+### Why This Works (Mathematical Justification)
 
 This is the **exact same algorithm** used in the original Titans paper (Section 3.2):
 
@@ -221,31 +230,37 @@ This is the **exact same algorithm** used in the original Titans paper (Section 
 
 ---
 
-#### Implementation in Code
+### Implementation in Code
 
 From `rnn_memory.py`:
 
 ```python
-# Compute outer products
-G = torch.einsum('bti,btj->btij', phi_k, phi_k)
-B = torch.einsum('bti,btj->btij', v_bh, phi_k)
+# Exact refactor: build gradient directly (no separate G/B tensors)
+pred = torch.einsum('bde,bte->btd', S_ref, phi_k)          # [BH, T, d]
+delta_vec = pred - v_bh                                     # [BH, T, d]
+g_raw = torch.einsum('bti,btj->btij', delta_vec, phi_k)     # [BH, T, d, d]
 
-# Apply omega window (sliding sum)
-G_w = _sliding_sum_along_time(G, omega_window)
-B_w = _sliding_sum_along_time(B, omega_window)
+# Apply omega gate to g (not to G/B separately)
+if exists(omega_gate):
+    g_raw = g_raw * omega_gate[..., None, None]
 
-# Gradient using fixed S0 (one batch matmul!)
-g = torch.einsum('bde,btef->btdf', S0, G_w) - B_w
+# Omega window: sliding sum of g (single buffer, not G+B)
+if omega_window > 1:
+    prev_g = omega_buffer if exists(omega_buffer) else g_raw.new_zeros((BH, omega_window - 1, d, d))
+    g_ext = torch.cat([prev_g, g_raw], dim=1)
+    g = _sliding_sum_along_time(g_ext, omega_window)[:, -seq_len:]
+else:
+    g = g_raw
 
 # Momentum via scalar scan
-Z_all = _scalar_scan(momentum, g, Z0)
+Z_all = self.assoc_scan(momentum, g, prev=Z0)
 
 # Delta and state via scalar scan
 delta = -lr_e * Z_all
-S_all = _scalar_scan(decay, delta, S0)
+S_all = self.assoc_scan(decay, delta, prev=S0)
 ```
 
-#### Retrieval Uses Previous State
+### Retrieval Uses Previous State
 
 Critical detail: retrieval at step $t$ uses the **previous** state $S_{t-1}$:
 
@@ -254,10 +269,13 @@ $$y_t = S_{t-1} \, \psi_t \quad \text{where } \psi_t = \phi(q_t)$$
 In code:
 
 ```python
-# S_start = [S_0, S_1, ..., S_{T-1}] (shifted by 1)
-S_start = torch.cat([S0.unsqueeze(1), S_all[:, :-1]], dim=1)
-# y_t = S_{t-1} @ ψ_t
-retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)
+# y_t = S_{t-1} @ ψ_t  (avoid concatenating full S_start)
+y0 = torch.einsum('bde,be->bd', S0, phi_q[:, 0])  # [BH, d]
+if seq_len > 1:
+    y_rest = torch.einsum('btdp,btp->btd', S_all[:, :-1], phi_q[:, 1:])  # [BH, T-1, d]
+    retrieved = torch.cat([y0.unsqueeze(1), y_rest], dim=1)              # [BH, T, d]
+else:
+    retrieved = y0.unsqueeze(1)
 ```
 
 This ensures the model doesn't "see into the future" during training.
@@ -279,6 +297,56 @@ This ensures the model doesn't "see into the future" during training.
 pip install -e .
 pip install -e ".[examples]"
 ```
+
+## CUDA Backend (Omega=16, optional)
+
+Atlas-RNN includes an **optional CUDA backend** for the _exact_ Omega sliding-window update when:
+
+- **`omega_window == 16`**, and
+- you pass **`use_cuda=True`** to `OmegaRNNMemoryCell`, and
+- you run on an NVIDIA GPU with CUDA toolkit available.
+
+This CUDA path was made numerically stable for long backstepping by using **checkpoint anchoring (K=16)** inside the CUDA implementation.
+
+### Compile the CUDA extension (A100 recommended)
+
+On a CUDA machine with `nvcc`:
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+pip install -U pip ninja
+
+cd atlas_pytorch/cuda
+python3 compile.py
+```
+
+If you see `CUDA_HOME environment variable is not set`, set `CUDA_HOME` as above.
+
+### Use the CUDA backend
+
+```python
+import torch
+from atlas_pytorch.rnn_memory import OmegaRNNMemoryCell
+
+cell = OmegaRNNMemoryCell(
+    dim=896,
+    dim_head=64,
+    heads=14,
+    omega_window=16,     # required for CUDA backend
+    use_omega_gate=True,
+    use_momentum=True,
+    poly_degree=2,
+    poly_mode="elementwise",
+    use_cuda=True,
+).to("cuda", dtype=torch.bfloat16)
+```
+
+Notes:
+
+- The CUDA kernel operates in **bf16**; keep module + inputs in bf16 for best behavior.
+- `omega_window != 16` will **automatically fall back** to the PyTorch path.
+- When the CUDA backend is active, `assoc_scan` / Triton acceleration is **not used** for Omega=16.
 
 ## Usage
 
@@ -422,6 +490,19 @@ pytest -q tests/test_rnn_all.py
 # Specific tests
 pytest -q tests/test_rnn_all.py -k "assoc_scan"
 ```
+
+### GPU / CUDA tests
+
+On a CUDA machine (after compiling the extension above):
+
+```bash
+pytest -q tests/test_atlas_cuda.py
+pytest -q tests/test_cuda_integration.py
+pytest -q tests/test_atlas_performance.py -k "memory_" -s
+```
+
+> PyTorch vs CUDA parity: the PyTorch path uses `assoc_scan` (different accumulation order),
+> while the CUDA kernel uses explicit float accumulations. In bf16 this can produce small numeric differences.
 
 ## Implementation Notes
 

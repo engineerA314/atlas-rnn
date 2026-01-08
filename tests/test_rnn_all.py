@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from einops import rearrange
 
 from atlas_pytorch.rnn_memory import (
     RNNMemoryCell,
@@ -13,6 +14,252 @@ from atlas_pytorch.rnn_memory import (
 from atlas_pytorch.rnn_transformer import RNNMemoryTransformer
 from assoc_scan import AssocScan
 import math
+
+# small local helper (mirrors atlas_pytorch style)
+def exists(v):
+    return v is not None
+
+def _dtype_close_kwargs(dtype: torch.dtype):
+    # fp32 should be very tight; bf16/fp16 may differ slightly due to different op ordering
+    if dtype == torch.float32:
+        return dict(atol=1e-5, rtol=1e-5)
+    if dtype in (torch.float16, torch.bfloat16):
+        return dict(atol=2e-2, rtol=2e-2)
+    return dict(atol=1e-5, rtol=1e-5)
+
+def _supported_test_dtypes(device: torch.device):
+    # Keep CPU deterministic + fast; exercise fp16/bf16 only when CUDA is available.
+    if device.type == "cuda":
+        return (torch.float32, torch.float16, torch.bfloat16)
+    return (torch.float32,)
+
+def _scaled_randn(shape, *, device, dtype, scale: float):
+    return torch.randn(*shape, device=device, dtype=dtype) * scale
+
+# -----------------------------------------------------------------------------
+# Reference implementations (pre-optimization)
+# -----------------------------------------------------------------------------
+
+def _reference_forward_rnn_memory_cell(
+    cell: RNNMemoryCell,
+    x: torch.Tensor,
+    state: RNNMemState | None = None,
+):
+    """
+    Reference forward that matches the pre-change implementation:
+    - materializes S_start = cat([S0, S_all[:, :-1]]) and uses it for retrieval
+    - does not use scan_chunk_len optimization
+    """
+    batch, seq_len, _ = x.shape
+
+    if state is None:
+        state = cell.init_state(batch, x.device, x.dtype)
+
+    d = cell.dim_head
+
+    # Pre-norm + activation
+    x_act = cell.activation(cell.pre_norm(x))
+
+    q_in = k_in = v_in = x_act
+
+    # Optional depthwise conv
+    if exists(cell.q_conv):
+        q_in = cell.q_conv(q_in.transpose(1, 2)).transpose(1, 2)
+    if exists(cell.k_conv):
+        k_in = cell.k_conv(k_in.transpose(1, 2)).transpose(1, 2)
+    if exists(cell.v_conv):
+        v_in = cell.v_conv(v_in.transpose(1, 2)).transpose(1, 2)
+
+    # Project to Q, K, V and split heads: [batch, heads, seq, dim_head]
+    q = cell.split_heads(cell.to_q(q_in))
+    k = cell.split_heads(cell.to_k(k_in))
+    v = cell.split_heads(cell.to_v(v_in))
+
+    # Truncate to original seq_len in case conv changed length
+    q = q[:, :, :seq_len]
+    k = k[:, :, :seq_len]
+    v = v[:, :, :seq_len]
+
+    q = cell.q_norm(q)
+    k = cell.k_norm(k)
+
+    # Apply polynomial feature map
+    k_flat = rearrange(k, 'b h n d -> (b h n) d')
+    q_flat = rearrange(q, 'b h n d -> (b h n) d')
+
+    phi_k = rearrange(cell.phi(k_flat), '(b h n) d -> (b h) n d', b=batch, h=cell.heads, n=seq_len)
+    phi_q = rearrange(cell.phi(q_flat), '(b h n) d -> (b h) n d', b=batch, h=cell.heads, n=seq_len)
+    v_bh = rearrange(v, 'b h n d -> (b h) n d')
+
+    # Learned hyperparameters: [BH, T]
+    lr = rearrange(cell.to_lr(x_act), 'b n h -> (b h) n')
+    decay = rearrange(cell.to_decay(x_act), 'b n h -> (b h) n')
+
+    if cell.use_momentum:
+        momentum = rearrange(cell.to_momentum(x_act), 'b n h -> (b h) n')
+
+    # Step 1: outer products
+    G = torch.einsum('bti,btj->btij', phi_k, phi_k)
+    B = torch.einsum('bti,btj->btij', v_bh, phi_k)
+
+    S0 = state.S
+    Z0 = state.Z if exists(state.Z) else torch.zeros_like(S0)
+
+    # Step 2: fixed S0 gradient
+    g = torch.einsum('bde,btef->btdf', S0, G) - B
+
+    lr_e = lr[..., None, None]
+
+    if cell.use_momentum:
+        Z_all = cell.assoc_scan(momentum, g, prev=Z0)
+        delta = -lr_e * Z_all
+        S_all = cell.assoc_scan(decay, delta, prev=S0)
+        S_end = S_all[:, -1].clamp(-100, 100)
+        Z_end = Z_all[:, -1]
+    else:
+        delta = -lr_e * g
+        S_all = cell.assoc_scan(decay, delta, prev=S0)
+        S_end = S_all[:, -1].clamp(-100, 100)
+        Z_end = None
+
+    # Retrieval (pre-change): materialize S_start
+    S_start = torch.cat([S0.unsqueeze(1), S_all[:, :-1]], dim=1)
+    retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)
+
+    retrieved = rearrange(retrieved, '(b h) t d -> b h t d', b=batch, h=cell.heads)
+    retrieved = cell.merge_heads(retrieved)
+    retrieved = cell.to_out(retrieved)
+
+    next_state = RNNMemState(
+        seq_index=state.seq_index + seq_len,
+        S=S_end,
+        Z=Z_end,
+        omega_buffer=None,
+    )
+
+    return retrieved, next_state
+
+
+def _reference_forward_omega_rnn_memory_cell(
+    cell: OmegaRNNMemoryCell,
+    x: torch.Tensor,
+    state: RNNMemState | None = None,
+):
+    """
+    Reference forward that matches the pre-change Omega implementation:
+    - materializes S_start = cat([S0, S_all[:, :-1]]) and uses it for retrieval
+    - does not use scan_chunk_len optimization
+    """
+    batch, seq_len, _ = x.shape
+    e = cell.omega_window
+
+    if state is None:
+        state = cell.init_state(batch, x.device, x.dtype)
+
+    d = cell.dim_head
+    BH = batch * cell.heads
+
+    x_normed = cell.activation(cell.pre_norm(x))
+
+    q_in = k_in = v_in = x_normed
+
+    if exists(cell.q_conv):
+        q_in = cell.q_conv(q_in.transpose(1, 2)).transpose(1, 2)
+    if exists(cell.k_conv):
+        k_in = cell.k_conv(k_in.transpose(1, 2)).transpose(1, 2)
+    if exists(cell.v_conv):
+        v_in = cell.v_conv(v_in.transpose(1, 2)).transpose(1, 2)
+
+    q = cell.split_heads(cell.to_q(q_in))
+    k = cell.split_heads(cell.to_k(k_in))
+    v = cell.split_heads(cell.to_v(v_in))
+
+    q = q[:, :, :seq_len]
+    k = k[:, :, :seq_len]
+    v = v[:, :, :seq_len]
+
+    q = cell.q_norm(q)
+    k = cell.k_norm(k)
+
+    k_flat = rearrange(k, 'b h n d -> (b h n) d')
+    q_flat = rearrange(q, 'b h n d -> (b h n) d')
+
+    phi_k = rearrange(cell.phi(k_flat), '(b h n) d -> (b h) n d', b=batch, h=cell.heads, n=seq_len)
+    phi_q = rearrange(cell.phi(q_flat), '(b h n) d -> (b h) n d', b=batch, h=cell.heads, n=seq_len)
+    v_bh = rearrange(v, 'b h n d -> (b h) n d')
+
+    lr = rearrange(cell.to_lr(x_normed), 'b n h -> (b h) n')
+    decay = rearrange(cell.to_decay(x_normed), 'b n h -> (b h) n')
+
+    if cell.use_momentum:
+        momentum = rearrange(cell.to_momentum(x_normed), 'b n h -> (b h) n')
+
+    omega_gate = None
+    if cell.use_omega_gate:
+        omega_gate = rearrange(cell.to_omega_gate(x_normed), 'b n h -> (b h) n')
+
+    G_raw = torch.einsum('bti,btj->btij', phi_k, phi_k)
+    B_raw = torch.einsum('bti,btj->btij', v_bh, phi_k)
+
+    if exists(omega_gate):
+        gate_e = omega_gate[..., None, None]
+        G_raw = G_raw * gate_e
+        B_raw = B_raw * gate_e
+
+    if e > 1:
+        omega_buffer = state.omega_buffer
+        if exists(omega_buffer):
+            prev_G = omega_buffer[..., 0]
+            prev_B = omega_buffer[..., 1]
+        else:
+            prev_G = G_raw.new_zeros((BH, e - 1, d, d))
+            prev_B = B_raw.new_zeros((BH, e - 1, d, d))
+
+        G_ext = torch.cat([prev_G, G_raw], dim=1)
+        B_ext = torch.cat([prev_B, B_raw], dim=1)
+
+        G = _sliding_sum_along_time(G_ext, e)[:, -(seq_len):]
+        B = _sliding_sum_along_time(B_ext, e)[:, -(seq_len):]
+
+        new_omega_buffer = torch.stack([G_ext[:, -(e - 1):], B_ext[:, -(e - 1):]], dim=-1)
+    else:
+        G = G_raw
+        B = B_raw
+        new_omega_buffer = None
+
+    S0 = state.S
+    Z0 = state.Z if exists(state.Z) else torch.zeros_like(S0)
+
+    g = torch.einsum('bde,btef->btdf', S0, G) - B
+    lr_e = lr[..., None, None]
+
+    if cell.use_momentum:
+        Z_all = cell.assoc_scan(momentum, g, prev=Z0)
+        delta = -lr_e * Z_all
+        S_all = cell.assoc_scan(decay, delta, prev=S0)
+        S_end = S_all[:, -1].clamp(-100, 100)
+        Z_end = Z_all[:, -1]
+    else:
+        delta = -lr_e * g
+        S_all = cell.assoc_scan(decay, delta, prev=S0)
+        S_end = S_all[:, -1].clamp(-100, 100)
+        Z_end = None
+
+    S_start = torch.cat([S0.unsqueeze(1), S_all[:, :-1]], dim=1)
+    retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)
+
+    retrieved = rearrange(retrieved, '(b h) t d -> b h t d', b=batch, h=cell.heads)
+    retrieved = cell.merge_heads(retrieved)
+    retrieved = cell.to_out(retrieved)
+
+    next_state = RNNMemState(
+        seq_index=state.seq_index + seq_len,
+        S=S_end,
+        Z=Z_end,
+        omega_buffer=new_omega_buffer,
+    )
+
+    return retrieved, next_state
 
 # -----------------------------------------------------------------------------
 # CUDA / Triton integration test (skip on non-CUDA)
@@ -85,6 +332,22 @@ def test_rnn_memory_cell_forward():
     assert state.Z is not None
 
 
+def test_rnn_memory_cell_scan_chunk_len_matches_unchunked():
+    torch.manual_seed(0)
+    base = RNNMemoryCell(dim=64, dim_head=32, heads=2, use_momentum=True, qkv_conv_kernel=4, scan_chunk_len=None)
+    torch.manual_seed(0)
+    chunked = RNNMemoryCell(dim=64, dim_head=32, heads=2, use_momentum=True, qkv_conv_kernel=4, scan_chunk_len=4)
+    chunked.load_state_dict(base.state_dict())
+
+    x = torch.randn(2, 13, 64)
+    out_base, s_base = base(x)
+    out_chunk, s_chunk = chunked(x)
+
+    assert torch.allclose(out_base, out_chunk, atol=1e-5)
+    assert torch.allclose(s_base.S, s_chunk.S, atol=1e-5)
+    assert torch.allclose(s_base.Z, s_chunk.Z, atol=1e-5)
+
+
 def test_omega_rnn_memory_cell_forward():
     cell = OmegaRNNMemoryCell(dim=64, dim_head=32, heads=2, omega_window=3, use_omega_gate=True)
     x = torch.randn(2, 12, 64)
@@ -92,6 +355,362 @@ def test_omega_rnn_memory_cell_forward():
     assert out.shape == x.shape
     assert state.S.shape == (4, 32, 32)
     assert state.omega_buffer is not None
+
+
+def test_omega_rnn_memory_cell_scan_chunk_len_matches_unchunked():
+    torch.manual_seed(0)
+    base = OmegaRNNMemoryCell(dim=64, dim_head=32, heads=2, omega_window=3, use_omega_gate=True, qkv_conv_kernel=4, scan_chunk_len=None)
+    torch.manual_seed(0)
+    chunked = OmegaRNNMemoryCell(dim=64, dim_head=32, heads=2, omega_window=3, use_omega_gate=True, qkv_conv_kernel=4, scan_chunk_len=4)
+    chunked.load_state_dict(base.state_dict())
+
+    x = torch.randn(2, 13, 64)
+    out_base, s_base = base(x)
+    out_chunk, s_chunk = chunked(x)
+
+    assert torch.allclose(out_base, out_chunk, atol=1e-5)
+    assert torch.allclose(s_base.S, s_chunk.S, atol=1e-5)
+    assert torch.allclose(s_base.Z, s_chunk.Z, atol=1e-5)
+    assert torch.allclose(s_base.omega_buffer, s_chunk.omega_buffer, atol=1e-5)
+
+
+@pytest.mark.parametrize("use_momentum", (False, True))
+@pytest.mark.parametrize("scan_chunk_len", (None, 4))
+def test_rnn_memory_cell_matches_reference_prechange(use_momentum, scan_chunk_len):
+    torch.manual_seed(0)
+    cell = RNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        use_momentum=use_momentum,
+        qkv_conv_kernel=4,
+        scan_chunk_len=scan_chunk_len,
+    )
+    x = torch.randn(2, 13, 64)
+
+    # use a non-trivial initial state
+    S = torch.randn(2 * cell.heads, cell.dim_head, cell.dim_head)
+    Z = torch.randn_like(S) if use_momentum else None
+    state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=None)
+
+    out_new, st_new = cell(x, state=state0)
+    out_ref, st_ref = _reference_forward_rnn_memory_cell(cell, x, state=state0)
+
+    assert torch.allclose(out_new, out_ref, atol=1e-5)
+    assert torch.allclose(st_new.S, st_ref.S, atol=1e-5)
+    if use_momentum:
+        assert torch.allclose(st_new.Z, st_ref.Z, atol=1e-5)
+    else:
+        assert st_new.Z is None and st_ref.Z is None
+
+
+@pytest.mark.parametrize("use_momentum", (False, True))
+@pytest.mark.parametrize("use_omega_gate", (False, True))
+@pytest.mark.parametrize("scan_chunk_len", (None, 4))
+def test_omega_rnn_memory_cell_matches_reference_prechange(use_momentum, use_omega_gate, scan_chunk_len):
+    torch.manual_seed(0)
+    cell = OmegaRNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        omega_window=3,
+        use_omega_gate=use_omega_gate,
+        use_momentum=use_momentum,
+        qkv_conv_kernel=4,
+        scan_chunk_len=scan_chunk_len,
+    )
+    x = torch.randn(2, 13, 64)
+
+    S = torch.randn(2 * cell.heads, cell.dim_head, cell.dim_head)
+    Z = torch.randn_like(S) if use_momentum else None
+    omega_buffer = torch.randn(2 * cell.heads, cell.omega_window - 1, cell.dim_head, cell.dim_head, 2)
+    state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=omega_buffer)
+
+    out_new, st_new = cell(x, state=state0)
+    out_ref, st_ref = _reference_forward_omega_rnn_memory_cell(cell, x, state=state0)
+
+    assert torch.allclose(out_new, out_ref, atol=1e-5)
+    assert torch.allclose(st_new.S, st_ref.S, atol=1e-5)
+    if use_momentum:
+        assert torch.allclose(st_new.Z, st_ref.Z, atol=1e-5)
+    else:
+        assert st_new.Z is None and st_ref.Z is None
+    assert torch.allclose(st_new.omega_buffer, st_ref.omega_buffer, atol=1e-5)
+
+
+# -----------------------------------------------------------------------------
+# Stronger equivalence tests (more seeds / poly / longer seq / dtype)
+# -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("poly_mode,poly_degree", (("off", 1), ("elementwise", 2), ("tensor", 2)))
+@pytest.mark.parametrize("seq_len", (13, 64, 129))
+@pytest.mark.parametrize("use_momentum", (False, True))
+def test_rnn_memory_cell_matches_reference_strong_cpu_fp32(seed, poly_mode, poly_degree, seq_len, use_momentum):
+    # CPU fp32-only strong coverage (keeps CI/runtime reasonable and avoids dtype flakiness on CPU)
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    torch.manual_seed(seed)
+    cell = RNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        use_momentum=use_momentum,
+        poly_mode=poly_mode,
+        poly_degree=poly_degree,
+        qkv_conv_kernel=4,
+        scan_chunk_len=None,
+    ).to(device=device, dtype=dtype)
+
+    x = torch.randn(2, seq_len, 64, device=device, dtype=dtype)
+
+    # Keep states in a realistic range (in practice S is clamped each step)
+    S = _scaled_randn((2 * cell.heads, cell.dim_head, cell.dim_head), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+    Z = _scaled_randn(S.shape, device=device, dtype=dtype, scale=0.1) if use_momentum else None
+    state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=None)
+
+    out_new, st_new = cell(x, state=state0)
+    out_ref, st_ref = _reference_forward_rnn_memory_cell(cell, x, state=state0)
+
+    kw = _dtype_close_kwargs(dtype)
+    assert torch.allclose(out_new, out_ref, **kw)
+    assert torch.allclose(st_new.S, st_ref.S, **kw)
+    if use_momentum:
+        assert torch.allclose(st_new.Z, st_ref.Z, **kw)
+    else:
+        assert st_new.Z is None and st_ref.Z is None
+
+
+@pytest.mark.parametrize("seed", (0, 1))
+@pytest.mark.parametrize("poly_mode,poly_degree", (("off", 1), ("elementwise", 2)))
+@pytest.mark.parametrize("seq_len", (64, 256))
+@pytest.mark.parametrize("use_momentum", (False, True))
+def test_rnn_memory_cell_matches_reference_strong_cuda_dtypes(seed, poly_mode, poly_degree, seq_len, use_momentum):
+    # Only meaningful when CUDA is present (exercise fp16/bf16)
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    for dtype in _supported_test_dtypes(device):
+        torch.manual_seed(seed)
+        cell = RNNMemoryCell(
+            dim=64,
+            dim_head=32,
+            heads=2,
+            use_momentum=use_momentum,
+            poly_mode=poly_mode,
+            poly_degree=poly_degree,
+            qkv_conv_kernel=4,
+            scan_chunk_len=None,
+        ).to(device=device, dtype=dtype)
+
+        x = torch.randn(2, seq_len, 64, device=device, dtype=dtype)
+
+        S = _scaled_randn((2 * cell.heads, cell.dim_head, cell.dim_head), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+        Z = _scaled_randn(S.shape, device=device, dtype=dtype, scale=0.1) if use_momentum else None
+        state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=None)
+
+        out_new, st_new = cell(x, state=state0)
+        out_ref, st_ref = _reference_forward_rnn_memory_cell(cell, x, state=state0)
+
+        kw = _dtype_close_kwargs(dtype)
+        assert torch.allclose(out_new, out_ref, **kw)
+        assert torch.allclose(st_new.S, st_ref.S, **kw)
+        if use_momentum:
+            assert torch.allclose(st_new.Z, st_ref.Z, **kw)
+        else:
+            assert st_new.Z is None and st_ref.Z is None
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("poly_mode,poly_degree", (("off", 1), ("elementwise", 2), ("tensor", 2)))
+@pytest.mark.parametrize("seq_len", (13, 64, 129))
+@pytest.mark.parametrize("use_momentum", (False, True))
+@pytest.mark.parametrize("use_omega_gate", (False, True))
+def test_omega_rnn_memory_cell_matches_reference_strong_cpu_fp32(seed, poly_mode, poly_degree, seq_len, use_momentum, use_omega_gate):
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    torch.manual_seed(seed)
+    cell = OmegaRNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        omega_window=3,
+        use_omega_gate=use_omega_gate,
+        use_momentum=use_momentum,
+        poly_mode=poly_mode,
+        poly_degree=poly_degree,
+        qkv_conv_kernel=4,
+        scan_chunk_len=None,
+    ).to(device=device, dtype=dtype)
+
+    x = torch.randn(2, seq_len, 64, device=device, dtype=dtype)
+
+    S = _scaled_randn((2 * cell.heads, cell.dim_head, cell.dim_head), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+    Z = _scaled_randn(S.shape, device=device, dtype=dtype, scale=0.1) if use_momentum else None
+    omega_buffer = _scaled_randn((2 * cell.heads, cell.omega_window - 1, cell.dim_head, cell.dim_head, 2), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+    state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=omega_buffer)
+
+    out_new, st_new = cell(x, state=state0)
+    out_ref, st_ref = _reference_forward_omega_rnn_memory_cell(cell, x, state=state0)
+
+    kw = _dtype_close_kwargs(dtype)
+    assert torch.allclose(out_new, out_ref, **kw)
+    assert torch.allclose(st_new.S, st_ref.S, **kw)
+    if use_momentum:
+        assert torch.allclose(st_new.Z, st_ref.Z, **kw)
+    else:
+        assert st_new.Z is None and st_ref.Z is None
+    assert torch.allclose(st_new.omega_buffer, st_ref.omega_buffer, **kw)
+
+
+@pytest.mark.parametrize("seed", (0, 1))
+@pytest.mark.parametrize("poly_mode,poly_degree", (("off", 1), ("elementwise", 2)))
+@pytest.mark.parametrize("seq_len", (64, 256))
+@pytest.mark.parametrize("use_momentum", (False, True))
+@pytest.mark.parametrize("use_omega_gate", (False, True))
+def test_omega_rnn_memory_cell_matches_reference_strong_cuda_dtypes(seed, poly_mode, poly_degree, seq_len, use_momentum, use_omega_gate):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    for dtype in _supported_test_dtypes(device):
+        torch.manual_seed(seed)
+        cell = OmegaRNNMemoryCell(
+            dim=64,
+            dim_head=32,
+            heads=2,
+            omega_window=3,
+            use_omega_gate=use_omega_gate,
+            use_momentum=use_momentum,
+            poly_mode=poly_mode,
+            poly_degree=poly_degree,
+            qkv_conv_kernel=4,
+            scan_chunk_len=None,
+        ).to(device=device, dtype=dtype)
+        
+        x = torch.randn(2, seq_len, 64, device=device, dtype=dtype)
+        
+        S = _scaled_randn((2 * cell.heads, cell.dim_head, cell.dim_head), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+        Z = _scaled_randn(S.shape, device=device, dtype=dtype, scale=0.1) if use_momentum else None
+        omega_buffer = _scaled_randn((2 * cell.heads, cell.omega_window - 1, cell.dim_head, cell.dim_head, 2), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+        state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=omega_buffer)
+        
+        out_new, st_new = cell(x, state=state0)
+        out_ref, st_ref = _reference_forward_omega_rnn_memory_cell(cell, x, state=state0)
+        
+        kw = _dtype_close_kwargs(dtype)
+        assert torch.allclose(out_new, out_ref, **kw)
+        assert torch.allclose(st_new.S, st_ref.S, **kw)
+        if use_momentum:
+            assert torch.allclose(st_new.Z, st_ref.Z, **kw)
+        else:
+            assert st_new.Z is None and st_ref.Z is None
+        assert torch.allclose(st_new.omega_buffer, st_ref.omega_buffer, **kw)
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("poly_mode,poly_degree", (("off", 1), ("elementwise", 2), ("tensor", 2)))
+@pytest.mark.parametrize("seq_len", (64, 129))
+@pytest.mark.parametrize("use_momentum", (False, True))
+def test_rnn_memory_cell_chunked_close_to_unchunked_cpu_fp32(seed, poly_mode, poly_degree, seq_len, use_momentum):
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    torch.manual_seed(seed)
+    base = RNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        use_momentum=use_momentum,
+        poly_mode=poly_mode,
+        poly_degree=poly_degree,
+        qkv_conv_kernel=4,
+        scan_chunk_len=None,
+    ).to(device=device, dtype=dtype)
+
+    torch.manual_seed(seed)
+    chunked = RNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        use_momentum=use_momentum,
+        poly_mode=poly_mode,
+        poly_degree=poly_degree,
+        qkv_conv_kernel=4,
+        scan_chunk_len=8,
+    ).to(device=device, dtype=dtype)
+    chunked.load_state_dict(base.state_dict())
+
+    x = torch.randn(2, seq_len, 64, device=device, dtype=dtype)
+    S = _scaled_randn((2 * base.heads, base.dim_head, base.dim_head), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+    Z = _scaled_randn(S.shape, device=device, dtype=dtype, scale=0.1) if use_momentum else None
+    state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=None)
+
+    out_base, st_base = base(x, state=state0)
+    out_chunk, st_chunk = chunked(x, state=state0)
+
+    # Chunking changes the scan reduction order -> allow slightly looser tolerance
+    assert torch.allclose(out_base, out_chunk, atol=1e-3, rtol=1e-3)
+    assert torch.allclose(st_base.S, st_chunk.S, atol=1e-3, rtol=1e-3)
+    if use_momentum:
+        assert torch.allclose(st_base.Z, st_chunk.Z, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("poly_mode,poly_degree", (("off", 1), ("elementwise", 2), ("tensor", 2)))
+@pytest.mark.parametrize("seq_len", (64, 129))
+@pytest.mark.parametrize("use_momentum", (False, True))
+@pytest.mark.parametrize("use_omega_gate", (False, True))
+def test_omega_rnn_memory_cell_chunked_close_to_unchunked_cpu_fp32(seed, poly_mode, poly_degree, seq_len, use_momentum, use_omega_gate):
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    torch.manual_seed(seed)
+    base = OmegaRNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        omega_window=3,
+        use_omega_gate=use_omega_gate,
+        use_momentum=use_momentum,
+        poly_mode=poly_mode,
+        poly_degree=poly_degree,
+        qkv_conv_kernel=4,
+        scan_chunk_len=None,
+    ).to(device=device, dtype=dtype)
+
+    torch.manual_seed(seed)
+    chunked = OmegaRNNMemoryCell(
+        dim=64,
+        dim_head=32,
+        heads=2,
+        omega_window=3,
+        use_omega_gate=use_omega_gate,
+        use_momentum=use_momentum,
+        poly_mode=poly_mode,
+        poly_degree=poly_degree,
+        qkv_conv_kernel=4,
+        scan_chunk_len=8,
+    ).to(device=device, dtype=dtype)
+    chunked.load_state_dict(base.state_dict())
+
+    x = torch.randn(2, seq_len, 64, device=device, dtype=dtype)
+    S = _scaled_randn((2 * base.heads, base.dim_head, base.dim_head), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+    Z = _scaled_randn(S.shape, device=device, dtype=dtype, scale=0.1) if use_momentum else None
+    omega_buffer = _scaled_randn((2 * base.heads, base.omega_window - 1, base.dim_head, base.dim_head, 2), device=device, dtype=dtype, scale=0.1).clamp(-10, 10)
+    state0 = RNNMemState(seq_index=7, S=S, Z=Z, omega_buffer=omega_buffer)
+
+    out_base, st_base = base(x, state=state0)
+    out_chunk, st_chunk = chunked(x, state=state0)
+
+    assert torch.allclose(out_base, out_chunk, atol=1e-3, rtol=1e-3)
+    assert torch.allclose(st_base.S, st_chunk.S, atol=1e-3, rtol=1e-3)
+    if use_momentum:
+        assert torch.allclose(st_base.Z, st_chunk.Z, atol=1e-3, rtol=1e-3)
+    assert torch.allclose(st_base.omega_buffer, st_chunk.omega_buffer, atol=1e-3, rtol=1e-3)
 
 
 def test_state_continuity_rnn():

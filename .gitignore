@@ -175,3 +175,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+CUDA_IMPLEMENTATION_STRATEGY.md
+PROGRESS_REPORT.md
